@@ -19,6 +19,8 @@ import { UrlSafetyService } from '@/modules/research/retrieval/url-safety.servic
 import { CompanyCrawlerService } from '@/modules/research/crawl/company-crawler.service';
 import { LinkDiscoveryService } from '@/modules/research/crawl/link-discovery.service';
 import { LinkRankingService } from '@/modules/research/crawl/link-ranking.service';
+import { RobotsPolicyService } from '@/modules/research/robots/robots-policy.service';
+import { PageExtractionService } from '@/modules/research/extraction/page-extraction.service';
 import { UserModel } from '@/modules/user/user.model';
 import { UserRepository } from '@/modules/user/user.repository';
 import type { RequestHandler } from 'express';
@@ -43,6 +45,8 @@ export type AppContainer = {
   linkDiscoveryService: Provider<LinkDiscoveryService>;
   linkRankingService: Provider<LinkRankingService>;
   companyCrawlerService: Provider<CompanyCrawlerService>;
+  robotsPolicyService: Provider<RobotsPolicyService>;
+  pageExtractionService: Provider<PageExtractionService>;
 };
 
 export const createAppContainer = (config: AppConfig): AppContainer => {
@@ -143,12 +147,24 @@ export const createAppContainer = (config: AppConfig): AppContainer => {
 
   const linkRankingService = singleton(() => new LinkRankingService());
 
+  const robotsPolicyService = singleton(
+    () =>
+      new RobotsPolicyService({
+        retrievalClient: retrievalClient(),
+        logger: logger(),
+      }),
+  );
+
+  const pageExtractionService = singleton(() => new PageExtractionService());
+
   const companyCrawlerService = singleton(
     () =>
       new CompanyCrawlerService({
         retrievalClient: retrievalClient(),
         linkDiscovery: linkDiscoveryService(),
         linkRanking: linkRankingService(),
+        robotsPolicy: robotsPolicyService(),
+        pageExtraction: pageExtractionService(),
         logger: logger(),
       }),
   );
@@ -173,5 +189,7 @@ export const createAppContainer = (config: AppConfig): AppContainer => {
     linkDiscoveryService,
     linkRankingService,
     companyCrawlerService,
+    robotsPolicyService,
+    pageExtractionService,
   };
 };

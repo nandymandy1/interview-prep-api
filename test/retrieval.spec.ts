@@ -947,6 +947,59 @@ describe('Retry-After parsing', () => {
   });
 });
 
+describe('injected clock consistency', () => {
+  it('A3. preflight DNS consumes the logical deadline: slow DNS times out before any HTTP attempt', async () => {
+    let now = 0;
+    const seen: string[] = [];
+    const slowDns: DnsResolver = async () => {
+      now += 20_000;
+      return [PUBLIC_IPV4];
+    };
+    const client = makeClient({
+      dns: slowDns,
+      http: scriptHttp([okResponse()], seen),
+      now: () => now,
+    });
+    const result = await client.retrieve({ url: 'http://public.example/', mode: 'production' });
+
+    expect(result.ok).toBe(false);
+
+    if (!result.ok) {
+      expect(result.failure.code).toBe('TIMEOUT');
+      expect(result.failure.url).toBe('http://public.example/');
+    }
+
+    expect(seen).toEqual([]);
+  });
+
+  it('A10. Retry-After HTTP dates use the injected clock, not wall time', async () => {
+    const fixedNow = 1_000_000;
+    const seen: string[] = [];
+    const sleeps: number[] = [];
+    const client = makeClient({
+      dns: productionDns(),
+      http: scriptHttp(
+        [
+          {
+            ...okResponse(),
+            status: 429,
+            headers: { 'retry-after': new Date(fixedNow + 3000).toUTCString() },
+          },
+          okResponse(),
+        ],
+        seen,
+      ),
+      sleeps,
+      now: () => fixedNow,
+    });
+    const result = await client.retrieve({ url: 'http://public.example/', mode: 'production' });
+
+    expect(result.ok).toBe(true);
+    expect(seen).toHaveLength(2);
+    expect(sleeps).toEqual([3000]);
+  });
+});
+
 describe('response bounds', () => {
   const boundedClient = (response: RetrievalHttpResponse): RetrievalClient =>
     makeClient({ dns: productionDns(), http: scriptHttp([response], []) });

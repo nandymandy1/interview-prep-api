@@ -1,8 +1,11 @@
-export const MAX_CRAWL_PAGES = 8;
+export const MAX_CRAWL_PAGE_REQUESTS = 8;
 export const MAX_CRAWL_DEPTH = 2;
 export const CRAWL_CONCURRENCY = 2;
 export const CRAWL_MIN_REQUEST_INTERVAL_MS = 200;
 export const MAX_SITE_CRAWL_DURATION_MS = 30_000;
+export const MAX_DISCOVERED_LINKS_PER_PAGE = 200;
+export const MAX_CRAWL_CANDIDATES = 500;
+export const MAX_ANCHOR_CHARS = 200;
 
 // Stripped for queue deduplication only (crawl-queue optimization). Sites may
 // legitimately route on other query params, which are preserved.

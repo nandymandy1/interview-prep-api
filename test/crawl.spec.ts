@@ -9,6 +9,8 @@ import {
 import type { CrawlCandidate } from '@/modules/research/crawl/crawl.type';
 import { LinkDiscoveryService } from '@/modules/research/crawl/link-discovery.service';
 import { LinkRankingService } from '@/modules/research/crawl/link-ranking.service';
+import { PageExtractionService } from '@/modules/research/extraction/page-extraction.service';
+import { RobotsPolicyService } from '@/modules/research/robots/robots-policy.service';
 import {
   RetrievalClient,
   type HttpGetter,
@@ -95,14 +97,30 @@ const scriptRetrieval = (
   },
 });
 
+const allowAllRobots = (): Pick<RobotsPolicyService, 'loadPolicy' | 'isUrlAllowed'> => ({
+  loadPolicy: async (origin: string) => ({
+    origin,
+    state: 'ok' as const,
+    crawlDelayMs: null,
+    allows: () => true,
+  }),
+  isUrlAllowed: () => true,
+});
+
 const makeCrawler = (
   retrieval: Pick<RetrievalClient, 'retrieve'>,
-  options: { sleeps?: number[]; now?: () => number } = {},
+  options: {
+    sleeps?: number[];
+    now?: () => number;
+    robotsPolicy?: Pick<RobotsPolicyService, 'loadPolicy' | 'isUrlAllowed'>;
+  } = {},
 ): CompanyCrawlerService =>
   new CompanyCrawlerService({
     retrievalClient: retrieval,
     linkDiscovery: new LinkDiscoveryService(),
     linkRanking: new LinkRankingService(),
+    robotsPolicy: options.robotsPolicy ?? allowAllRobots(),
+    pageExtraction: new PageExtractionService(),
     logger: makeLogger(),
     sleep: async (ms: number) => {
       options.sleeps?.push(ms);
@@ -206,12 +224,15 @@ describe('link discovery', () => {
     );
   });
 
-  it('duplicate hrefs collapse to one discovery', () => {
+  it('duplicate hrefs are returned raw for best-signal grouping downstream', () => {
     const links = discovery.discoverLinks(
       `${link('/about', 'About')}${link('/about#team', 'Team')}`,
       base,
     );
-    expect(links).toHaveLength(1);
+    expect(links).toEqual([
+      { url: 'https://acme.example/about', anchorText: 'About' },
+      { url: 'https://acme.example/about', anchorText: 'Team' },
+    ]);
   });
 });
 
@@ -621,8 +642,17 @@ describe('crawl traversal', () => {
           message: 'The remote server returned an error.',
         },
       ],
+      skipped: [],
       rankedLinks: [],
       truncated: false,
+      truncationReasons: [],
+      robots: [],
+      stats: {
+        pageRequestsAttempted: 1,
+        pagesSucceeded: 0,
+        pagesFailed: 1,
+        pagesSkipped: 0,
+      },
     });
     expect(seen).toEqual(['https://acme.example/']);
   });
@@ -789,6 +819,237 @@ describe('crawl traversal', () => {
   });
 });
 
+describe('Phase A carry-forward regressions', () => {
+  it('A1. failed pages consume the request budget: 50 broken links stay within 8 attempts', async () => {
+    const seen: string[] = [];
+    const routes: Record<string, StubRoute> = {
+      'https://acme.example/': {
+        body: Array.from({ length: 50 }, (_, index) => link(`/b${index}`, `B${index}`)).join(''),
+      },
+    };
+
+    for (let index = 0; index < 50; index += 1) {
+      routes[`https://acme.example/b${index}`] = { fail: { code: 'HTTP_ERROR', status: 404 } };
+    }
+
+    const crawler = makeCrawler(scriptRetrieval(routes, seen));
+    const result = await crawler.crawlCompanySite({
+      companyUrl: 'https://acme.example/',
+      mode: 'production',
+    });
+
+    expect(seen).toHaveLength(8);
+    expect(result.stats).toEqual({
+      pageRequestsAttempted: 8,
+      pagesSucceeded: 1,
+      pagesFailed: 7,
+      pagesSkipped: 0,
+    });
+    expect(result.truncationReasons).toContain('page-request-limit');
+  });
+
+  it('A2. private-suffix hosts scope per tenant, not per suffix', async () => {
+    const seen: string[] = [];
+    const crawler = makeCrawler(
+      scriptRetrieval(
+        {
+          'https://company.github.io/': {
+            body: [
+              link('/about', 'About'),
+              link('https://attacker.github.io/', 'Attacker'),
+              link('https://otherco.github.io/', 'Other'),
+            ].join(''),
+          },
+          'https://company.github.io/about': { body: '' },
+        },
+        seen,
+      ),
+    );
+    const result = await crawler.crawlCompanySite({
+      companyUrl: 'https://company.github.io/',
+      mode: 'production',
+    });
+
+    expect(seen).toContain('https://company.github.io/about');
+    expect(seen).not.toContain('https://attacker.github.io/');
+    expect(seen).not.toContain('https://otherco.github.io/');
+    expect(result.pages).toHaveLength(2);
+  });
+
+  it('A4. a URL discovered by two pages before fetching is fetched once', async () => {
+    const seen: string[] = [];
+    const crawler = makeCrawler(
+      scriptRetrieval(
+        {
+          'https://acme.example/': { body: `${link('/a', 'A')}${link('/b', 'B')}` },
+          'https://acme.example/a': { body: link('/foo', 'Foo A') },
+          'https://acme.example/b': { body: link('/foo', 'Foo B') },
+          'https://acme.example/foo': { body: '' },
+        },
+        seen,
+      ),
+    );
+    const result = await crawler.crawlCompanySite({
+      companyUrl: 'https://acme.example/',
+      mode: 'production',
+    });
+
+    expect(seen.filter((url) => url === 'https://acme.example/foo')).toHaveLength(1);
+    expect(
+      result.rankedLinks.filter((entry) => entry.url === 'https://acme.example/foo'),
+    ).toHaveLength(1);
+  });
+
+  it('A5. per-page discoveries are rank-capped with candidate-limit truncation', async () => {
+    const seen: string[] = [];
+    const crawler = makeCrawler(
+      scriptRetrieval(
+        {
+          'https://acme.example/': {
+            body: [
+              link('/careers', 'Careers'),
+              ...Array.from({ length: 250 }, (_, index) => link(`/g${index}`, `G${index}`)),
+            ].join(''),
+          },
+          'https://acme.example/careers': { body: '' },
+        },
+        seen,
+      ),
+    );
+    const result = await crawler.crawlCompanySite({
+      companyUrl: 'https://acme.example/',
+      mode: 'production',
+    });
+
+    // 251 discoveries collapse to the top 200 by rank; Careers survives the cap.
+    expect(result.rankedLinks).toHaveLength(200);
+    expect(result.rankedLinks[0]?.url).toBe('https://acme.example/careers');
+    expect(result.truncationReasons).toContain('candidate-limit');
+    expect(result.truncated).toBe(true);
+  });
+
+  it('A6. fetched pages preserve the candidate relevance that selected them', async () => {
+    const crawler = makeCrawler(
+      scriptRetrieval(
+        {
+          'https://acme.example/': { body: link('/foo', 'Careers') },
+          'https://acme.example/foo': { body: 'hiring page' },
+        },
+        [],
+      ),
+    );
+    const result = await crawler.crawlCompanySite({
+      companyUrl: 'https://acme.example/',
+      mode: 'production',
+    });
+
+    const page = result.pages.find((entry) => entry.finalUrl === 'https://acme.example/foo');
+    const ranked = result.rankedLinks.find((entry) => entry.url === 'https://acme.example/foo');
+    expect(page?.relevanceScore).toBeGreaterThanOrEqual(100);
+    expect(page?.relevanceScore).toBe(ranked?.score);
+  });
+
+  it('A7. duplicate URLs keep the best deterministic anchor signal', async () => {
+    const crawler = makeCrawler(
+      scriptRetrieval(
+        {
+          'https://acme.example/': {
+            body: `${link('/foo', 'Learn More')}${link('/foo', 'Careers')}`,
+          },
+          'https://acme.example/foo': { body: '' },
+        },
+        [],
+      ),
+    );
+    const result = await crawler.crawlCompanySite({
+      companyUrl: 'https://acme.example/',
+      mode: 'production',
+    });
+
+    const ranked = result.rankedLinks.filter((entry) => entry.url === 'https://acme.example/foo');
+    expect(ranked).toHaveLength(1);
+    expect(ranked[0]?.anchorText).toBe('Careers');
+    expect(ranked[0]?.score).toBeGreaterThanOrEqual(100);
+  });
+
+  it('A8. truncation reasons stay truthful across bounds', async () => {
+    const maxCrawler = makeCrawler(
+      scriptRetrieval(
+        {
+          'https://acme.example/': {
+            body: Array.from({ length: 10 }, (_, index) => link(`/p${index}`, `P${index}`)).join(
+              '',
+            ),
+          },
+          ...Object.fromEntries(
+            Array.from({ length: 10 }, (_, index) => [
+              `https://acme.example/p${index}`,
+              { body: '' },
+            ]),
+          ),
+        },
+        [],
+      ),
+    );
+    const maxed = await maxCrawler.crawlCompanySite({
+      companyUrl: 'https://acme.example/',
+      mode: 'production',
+    });
+    expect(maxed.truncationReasons).toContain('page-request-limit');
+
+    const chainCrawler = makeCrawler(
+      scriptRetrieval(
+        {
+          'https://acme.example/': { body: link('/a', 'A') },
+          'https://acme.example/a': { body: link('/b', 'B') },
+          'https://acme.example/b': { body: link('/c', 'C') },
+          'https://acme.example/c': { body: link('/d', 'D') },
+        },
+        [],
+      ),
+    );
+    const chained = await chainCrawler.crawlCompanySite({
+      companyUrl: 'https://acme.example/',
+      mode: 'production',
+    });
+    expect(chained.truncationReasons).toContain('depth-limit');
+
+    const completeCrawler = makeCrawler(
+      scriptRetrieval(
+        {
+          'https://acme.example/': { body: link('/about', 'About') },
+          'https://acme.example/about': { body: '' },
+        },
+        [],
+      ),
+    );
+    const complete = await completeCrawler.crawlCompanySite({
+      companyUrl: 'https://acme.example/',
+      mode: 'production',
+    });
+    expect(complete.truncated).toBe(false);
+    expect(complete.truncationReasons).toEqual([]);
+  });
+
+  it('A9. seed shares pacing: the first same-origin candidate waits the interval', async () => {
+    const sleeps: number[] = [];
+    const crawler = makeCrawler(
+      scriptRetrieval(
+        {
+          'https://acme.example/': { body: link('/a', 'A') },
+          'https://acme.example/a': { body: '' },
+        },
+        [],
+      ),
+      { sleeps },
+    );
+    await crawler.crawlCompanySite({ companyUrl: 'https://acme.example/', mode: 'production' });
+
+    expect(sleeps).toHaveLength(1);
+    expect(sleeps[0] ?? 0).toBeGreaterThan(150);
+  });
+});
+
 describe('local evaluator integration', () => {
   let server: Server | null = null;
   let baseUrl = '';
@@ -875,19 +1136,24 @@ describe('local evaluator integration', () => {
     server = null;
   };
 
-  const integrationCrawler = (): CompanyCrawlerService =>
-    new CompanyCrawlerService({
-      retrievalClient: new RetrievalClient({
-        urlSafety: new UrlSafetyService({ dnsResolver: mockDns({}) }),
-        logger: makeLogger(),
-        sleep: async () => {},
-        random: () => 0,
-      }),
+  const integrationCrawler = (): CompanyCrawlerService => {
+    const retrievalClient = new RetrievalClient({
+      urlSafety: new UrlSafetyService({ dnsResolver: mockDns({}) }),
+      logger: makeLogger(),
+      sleep: async () => {},
+      random: () => 0,
+    });
+
+    return new CompanyCrawlerService({
+      retrievalClient,
       linkDiscovery: new LinkDiscoveryService(),
       linkRanking: new LinkRankingService(),
+      robotsPolicy: new RobotsPolicyService({ retrievalClient, logger: makeLogger() }),
+      pageExtraction: new PageExtractionService(),
       logger: makeLogger(),
       sleep: async () => {},
     });
+  };
 
   it('crawls a local evaluator site: relative links, opaque careers ranking, 404 isolation', async () => {
     await startServer();
@@ -920,9 +1186,11 @@ describe('local evaluator integration', () => {
       expect(result.failures.map((failure) => failure.url)).toContain(`${baseUrl}/ghost`);
       expect(result.failures[0]).toMatchObject({ code: 'HTTP_ERROR', status: 404 });
 
-      // Only seed + discovered URLs were ever requested.
+      // Only seed + discovered URLs + the one well-known robots path were
+      // ever requested.
       const known = new Set([
         '/',
+        '/robots.txt',
         '/about',
         '/foo',
         '/privacy',
@@ -935,6 +1203,8 @@ describe('local evaluator integration', () => {
       for (const path of requestedPaths) {
         expect(known.has(path)).toBe(true);
       }
+
+      expect(requestedPaths).toContain('/robots.txt');
     } finally {
       await stopServer();
     }
@@ -949,10 +1219,14 @@ describe('local evaluator integration', () => {
         mode: 'production',
       });
 
+      // Retrieval safety blocks even the robots fetch, so the seed is never
+      // retrieved: nothing is fetched and the skip records the cause.
       expect(result.pages).toEqual([]);
       expect(result.finalSeedUrl).toBeNull();
-      expect(result.failures).toHaveLength(1);
-      expect(result.failures[0]?.code).toBe('BLOCKED_ADDRESS');
+      expect(result.failures).toEqual([]);
+      expect(result.skipped).toHaveLength(1);
+      expect(result.skipped[0]).toMatchObject({ reason: 'ROBOTS_UNAVAILABLE', depth: 0 });
+      expect(requestedPaths).toEqual([]);
     } finally {
       await stopServer();
     }

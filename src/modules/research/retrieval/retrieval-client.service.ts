@@ -165,10 +165,20 @@ export class RetrievalClient {
   }
 
   private async fetchResource(request: RetrievalRequest): Promise<RetrievedResource> {
-    const start = await this.urlSafety.validateUrl(request.url, request.mode);
+    // Shape validation is synchronous; the logical deadline starts before any
+    // DNS or HTTP work so preflight resolution cannot sit outside the budget.
+    const start = this.urlSafety.normalizeUrl(request.url);
     const deadlineAt = this.now() + RETRIEVAL_TOTAL_TIMEOUT_MS;
     const remainingMs = (): number => deadlineAt - this.now();
     let lastFailure: RetrievalException | null = null;
+
+    try {
+      await this.urlSafety.assertHostAllowed(start.hostname, request.mode, start.toString());
+    } catch (error) {
+      throw this.normalizeTransportError(error, start.toString());
+    }
+
+    this.throwIfExpired(remainingMs(), start.toString());
 
     for (let attempt = 1; attempt <= RETRIEVAL_MAX_ATTEMPTS; attempt += 1) {
       const startedAt = this.now();
@@ -358,7 +368,7 @@ export class RetrievalClient {
   private httpStatusToException(response: RetrievalHttpResponse, url: string): RetrievalException {
     const retryAfterMs =
       response.status === 429 || response.status === 503
-        ? (parseRetryAfterMs(response.headers['retry-after'], Date.now()) ?? undefined)
+        ? (parseRetryAfterMs(response.headers['retry-after'], this.now()) ?? undefined)
         : undefined;
 
     if (response.status === 429) {

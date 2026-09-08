@@ -3,6 +3,7 @@ import {
   CRAWL_ACTION_PATH_PATTERN,
   CRAWL_STATIC_ASSET_PATTERN,
   CRAWL_TRACKING_PARAMS,
+  MAX_ANCHOR_CHARS,
 } from '@/modules/research/crawl/crawl.constants';
 
 export type RawDiscoveredLink = {
@@ -10,13 +11,13 @@ export type RawDiscoveredLink = {
   anchorText: string;
 };
 
-// Cheerio anchor parsing is the only HTML processing in P2.2: discover links
-// and canonicalize them for the crawl queue. No text extraction here.
+// Cheerio anchor parsing: discover links and canonicalize them for the crawl
+// queue. Returns every raw anchor (including repeated URLs): the crawler
+// groups by normalized URL and keeps the best deterministic signal.
 export class LinkDiscoveryService {
   discoverLinks(html: string, pageUrl: string): RawDiscoveredLink[] {
     const $ = load(html);
     const links: RawDiscoveredLink[] = [];
-    const seen = new Set<string>();
 
     $('a[href]').each((_, element) => {
       const href = $(element).attr('href')?.trim() ?? '';
@@ -25,14 +26,13 @@ export class LinkDiscoveryService {
         return;
       }
 
-      const anchorText = $(element).text().replace(/\s+/g, ' ').trim();
+      const anchorText = $(element).text().replace(/\s+/g, ' ').trim().slice(0, MAX_ANCHOR_CHARS);
       const url = this.normalizeCrawlUrl(href, pageUrl);
 
-      if (!url || seen.has(url)) {
+      if (!url) {
         return;
       }
 
-      seen.add(url);
       links.push({ url, anchorText });
     });
 
