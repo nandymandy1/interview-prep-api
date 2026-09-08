@@ -6,21 +6,23 @@ import {
   MAX_RETRIEVAL_BYTES,
   RETRIEVAL_MAX_ATTEMPTS,
   RETRIEVAL_MAX_REDIRECTS,
+  RETRIEVAL_TOTAL_TIMEOUT_MS,
 } from '@/modules/research/retrieval/retrieval.constants';
 import {
   computeRetryDelayMs,
+  createRetrievalAxiosInstance,
   parseRetryAfterMs,
   RetrievalClient,
   type HttpGetter,
   type RetrievalHttpResponse,
 } from '@/modules/research/retrieval/retrieval-client.service';
-import {
-  RetrievalException,
-  toRetrievalFailure,
-  type RetrievalFailureCode,
-} from '@/modules/research/retrieval/retrieval.type';
+import { RetrievalException } from '@/modules/research/retrieval/retrieval.exception';
+import { toRetrievalFailure } from '@/modules/research/retrieval/retrieval.failure';
+import type { RetrievalFailureCode } from '@/modules/research/retrieval/retrieval.type';
 import {
   isBlockedIpAddress,
+  SafeDnsError,
+  sanitizeUrlForLogging,
   UrlSafetyService,
   type DnsResolver,
 } from '@/modules/research/retrieval/url-safety.service';
@@ -94,6 +96,8 @@ const makeClient = (options: {
   sleeps?: number[];
   randomValue?: number;
   timeoutMs?: number;
+  now?: () => number;
+  advanceOnSleep?: (ms: number) => void;
 }): RetrievalClient =>
   new RetrievalClient({
     urlSafety: new UrlSafetyService({ dnsResolver: options.dns ?? mockDns({}) }),
@@ -101,8 +105,10 @@ const makeClient = (options: {
     ...(options.http ? { httpGet: options.http } : {}),
     sleep: async (ms: number) => {
       options.sleeps?.push(ms);
+      options.advanceOnSleep?.(ms);
     },
     random: () => options.randomValue ?? 0,
+    ...(options.now ? { now: options.now } : {}),
     ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
   });
 
@@ -254,14 +260,16 @@ describe('production SSRF policy', () => {
 
 describe('evaluation mode compatibility', () => {
   const evaluationSafety = (): UrlSafetyService =>
-    new UrlSafetyService({ dnsResolver: throwingDns() });
+    new UrlSafetyService({ dnsResolver: mockDns({ localhost: ['127.0.0.1'] }) });
 
   it('22. localhost is allowed in evaluation mode', async () => {
-    const parsed = await evaluationSafety().validateUrl(
-      'http://localhost:8099/acme/',
-      'evaluation',
-    );
+    const dnsCalls: string[] = [];
+    const safety = new UrlSafetyService({
+      dnsResolver: mockDns({ localhost: ['127.0.0.1'] }, dnsCalls),
+    });
+    const parsed = await safety.validateUrl('http://localhost:8099/acme/', 'evaluation');
     expect(parsed.hostname).toBe('localhost');
+    expect(dnsCalls).toContain('localhost');
   });
 
   it('23. 127.0.0.1 is allowed in evaluation mode', async () => {
@@ -328,6 +336,275 @@ describe('evaluation mode compatibility', () => {
   });
 });
 
+describe('P2.1 hardening', () => {
+  it('Axios implicit environment proxying is disabled', () => {
+    const instance = createRetrievalAxiosInstance(8000);
+    expect(instance.defaults.proxy).toBe(false);
+    expect(instance.defaults.maxRedirects).toBe(0);
+  });
+
+  it('evaluation mode still resolves DNS and reports unknown hosts', async () => {
+    const safety = new UrlSafetyService({ dnsResolver: mockDns({}) });
+    const error = await expectRejectCode(
+      safety.validateUrl('http://nonexistent.example/', 'evaluation'),
+      'DNS_RESOLUTION_FAILED',
+    );
+    expect(error.url).toBe('http://nonexistent.example/');
+  });
+
+  it('blocked literals keep the full URL for provenance', async () => {
+    const error = await expectRejectCode(
+      productionSafety().validateUrl('http://127.0.0.1/private-page', 'production'),
+      'BLOCKED_ADDRESS',
+    );
+    expect(error.url).toBe('http://127.0.0.1/private-page');
+  });
+
+  it('connection-time lookup hands the vetted address to the socket', async () => {
+    const safety = new UrlSafetyService({ dnsResolver: productionDns() });
+    const lookup = safety.createConnectionLookup('production', 'http://public.example/');
+
+    const { address, family } = await new Promise<{ address: string; family?: number }>(
+      (resolve, reject) => {
+        lookup('public.example', {}, (error, result, resultFamily) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+
+          resolve({ address: result as string, family: resultFamily });
+        });
+      },
+    );
+
+    expect(address).toBe(PUBLIC_IPV4);
+    expect(family).toBe(4);
+  });
+
+  it('connection-time lookup rejects blocked addresses with full target provenance', async () => {
+    const safety = new UrlSafetyService({ dnsResolver: productionDns() });
+    const lookup = safety.createConnectionLookup('production', 'http://private.example/secret');
+
+    const error = await new Promise<SafeDnsError | null>((resolve) => {
+      lookup('private.example', {}, (lookupError) => {
+        resolve(lookupError instanceof SafeDnsError ? lookupError : null);
+      });
+    });
+
+    expect(error).toBeInstanceOf(SafeDnsError);
+    expect(error?.reason).toBe('blocked');
+    expect(error?.targetUrl).toBe('http://private.example/secret');
+  });
+
+  it('connection-time lookup reports unresolvable hosts with full target provenance', async () => {
+    const safety = new UrlSafetyService({ dnsResolver: mockDns({}) });
+    const lookup = safety.createConnectionLookup('evaluation', 'http://ghost.example/');
+
+    const error = await new Promise<SafeDnsError | null>((resolve) => {
+      lookup('ghost.example', {}, (lookupError) => {
+        resolve(lookupError instanceof SafeDnsError ? lookupError : null);
+      });
+    });
+
+    expect(error?.reason).toBe('unresolved');
+    expect(error?.targetUrl).toBe('http://ghost.example/');
+  });
+
+  it('rebinding between validation and connect is blocked before any socket opens', async () => {
+    let hits = 0;
+    const server = createServer((_, response) => {
+      hits += 1;
+      response.writeHead(200, { 'content-type': 'text/html' });
+      response.end('<html/>');
+    });
+    await new Promise<void>((resolve) => {
+      server.listen(0, '127.0.0.1', () => resolve());
+    });
+    const address = server.address();
+
+    try {
+      if (typeof address !== 'object' || address === null) {
+        throw new Error('rebind server did not bind');
+      }
+
+      const answers: string[][] = [[PUBLIC_IPV4], [PUBLIC_IPV4], ['127.0.0.1']];
+      const resolver: DnsResolver = async () => answers.shift() ?? [PUBLIC_IPV4];
+      const client = new RetrievalClient({
+        urlSafety: new UrlSafetyService({ dnsResolver: resolver }),
+        logger: makeLogger(),
+        sleep: async () => {},
+        random: () => 0,
+      });
+      const target = `http://localhost:${address.port}/`;
+      const result = await client.retrieve({ url: target, mode: 'production' });
+
+      expect(result.ok).toBe(false);
+
+      if (!result.ok) {
+        expect(result.failure.code).toBe('BLOCKED_ADDRESS');
+        expect(result.failure.url).toBe(target);
+      }
+
+      expect(hits).toBe(0);
+    } finally {
+      await new Promise<void>((resolve) => {
+        server.close(() => resolve());
+      });
+    }
+  });
+
+  it('evaluation localhost connects through the controlled lookup', async () => {
+    let hits = 0;
+    const seenHosts: string[] = [];
+    const server = createServer((_, response) => {
+      hits += 1;
+      response.writeHead(200, { 'content-type': 'text/html' });
+      response.end('<html>eval</html>');
+    });
+    await new Promise<void>((resolve) => {
+      server.listen(0, '127.0.0.1', () => resolve());
+    });
+    const address = server.address();
+
+    try {
+      if (typeof address !== 'object' || address === null) {
+        throw new Error('eval server did not bind');
+      }
+
+      const client = new RetrievalClient({
+        urlSafety: new UrlSafetyService({
+          dnsResolver: mockDns({ localhost: ['127.0.0.1'] }, seenHosts),
+        }),
+        logger: makeLogger(),
+        sleep: async () => {},
+        random: () => 0,
+      });
+      const result = await client.retrieve({
+        url: `http://localhost:${address.port}/`,
+        mode: 'evaluation',
+      });
+
+      expect(result.ok).toBe(true);
+      expect(hits).toBe(1);
+      expect(seenHosts).toContain('localhost');
+    } finally {
+      await new Promise<void>((resolve) => {
+        server.close(() => resolve());
+      });
+    }
+  });
+
+  it('slow redirect chains cannot exceed the total logical budget', async () => {
+    let now = 0;
+    const seen: string[] = [];
+    const advancingHttp: HttpGetter = async (url: string) => {
+      seen.push(url);
+      now += 6000;
+      return redirectResponse('http://public.example/next');
+    };
+    const client = makeClient({
+      dns: productionDns(),
+      http: advancingHttp,
+      sleeps: [],
+      now: () => now,
+      advanceOnSleep: (ms) => {
+        now += ms;
+      },
+    });
+    const result = await client.retrieve({ url: 'http://public.example/', mode: 'production' });
+
+    expect(result.ok).toBe(false);
+
+    if (!result.ok) {
+      expect(result.failure.code).toBe('TIMEOUT');
+      expect(result.failure.url).toBe('http://public.example/next');
+    }
+
+    expect(seen).toHaveLength(3);
+  });
+
+  it('retries cannot exceed the total logical budget', async () => {
+    let now = 0;
+    const seen: string[] = [];
+    const sleeps: number[] = [];
+    const slowFailingHttp: HttpGetter = async (url: string) => {
+      seen.push(url);
+      now += 6000;
+      return { ...okResponse(), status: 500 };
+    };
+    const client = makeClient({
+      dns: productionDns(),
+      http: slowFailingHttp,
+      sleeps,
+      now: () => now,
+      advanceOnSleep: (ms) => {
+        now += ms;
+      },
+    });
+    const result = await client.retrieve({ url: 'http://public.example/', mode: 'production' });
+
+    expect(result.ok).toBe(false);
+
+    if (!result.ok) {
+      expect(result.failure.code).toBe('TIMEOUT');
+    }
+
+    expect(seen).toHaveLength(3);
+    expect(sleeps).toEqual([250, 500]);
+  });
+
+  it('Retry-After waits cannot push a retrieval beyond the total deadline', async () => {
+    let now = 0;
+    const seen: string[] = [];
+    const sleeps: number[] = [];
+    const slowLimitedHttp: HttpGetter = async (url: string) => {
+      seen.push(url);
+      now += 6000;
+      return { ...okResponse(), status: 429, headers: { 'retry-after': '3600' } };
+    };
+    const client = makeClient({
+      dns: productionDns(),
+      http: slowLimitedHttp,
+      sleeps,
+      now: () => now,
+      advanceOnSleep: (ms) => {
+        now += ms;
+      },
+    });
+    const result = await client.retrieve({ url: 'http://public.example/', mode: 'production' });
+
+    expect(result.ok).toBe(false);
+
+    if (!result.ok) {
+      expect(result.failure.code).toBe('TIMEOUT');
+    }
+
+    expect(seen).toHaveLength(2);
+    expect(sleeps).toEqual([5000]);
+  });
+
+  it('total budget matches the documented constant', () => {
+    expect(RETRIEVAL_TOTAL_TIMEOUT_MS).toBe(15_000);
+  });
+});
+
+describe('log URL redaction', () => {
+  it.each([
+    ['query stripped', 'https://company.com/page?token=abc', 'https://company.com/page'],
+    [
+      'query and fragment stripped',
+      'https://company.com/page?token=abc#foo',
+      'https://company.com/page',
+    ],
+    ['credentials stripped', 'https://user:pass@company.com/page', 'https://company.com/page'],
+    ['port and path preserved', 'http://localhost:8099/acme/?x=1', 'http://localhost:8099/acme/'],
+    ['bare host kept', 'https://company.com/', 'https://company.com/'],
+    ['unparseable input guarded', 'not a url', '[unparseable-url]'],
+  ])('%s', (_label, raw, expected) => {
+    expect(sanitizeUrlForLogging(raw)).toBe(expected);
+  });
+});
+
 describe('DNS and redirect safety', () => {
   it('28. hostname resolving to a private IP is rejected without fetching', async () => {
     const seen: string[] = [];
@@ -338,6 +615,7 @@ describe('DNS and redirect safety', () => {
 
     if (!result.ok) {
       expect(result.failure.code).toBe('BLOCKED_ADDRESS');
+      expect(result.failure.url).toBe('http://private.example/');
     }
 
     expect(seen).toEqual([]);
@@ -352,6 +630,7 @@ describe('DNS and redirect safety', () => {
 
     if (!result.ok) {
       expect(result.failure.code).toBe('BLOCKED_ADDRESS');
+      expect(result.failure.url).toBe('http://multi.example/');
     }
 
     expect(seen).toEqual([]);
@@ -369,6 +648,7 @@ describe('DNS and redirect safety', () => {
 
     if (!result.ok) {
       expect(result.failure.code).toBe('BLOCKED_ADDRESS');
+      expect(result.failure.url).toBe('http://127.0.0.1/admin');
     }
 
     expect(seen).toEqual(['http://public.example/']);

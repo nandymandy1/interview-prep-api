@@ -1,11 +1,56 @@
 import { lookup } from 'node:dns/promises';
-import { isIP } from 'node:net';
-import {
-  RetrievalException,
-  type RetrievalMode,
-} from '@/modules/research/retrieval/retrieval.type';
+import { isIP, type LookupFunction } from 'node:net';
+import { RetrievalException } from '@/modules/research/retrieval/retrieval.exception';
+import type { RetrievalMode } from '@/modules/research/retrieval/retrieval.type';
 
 export type DnsResolver = (hostname: string) => Promise<string[]>;
+
+export type SafeDnsFailureReason = 'blocked' | 'unresolved';
+
+// Surfaced when the connection-time lookup rejects a destination. Carries the
+// full retrieval target so failure provenance keeps the exact URL, not just
+// the hostname. The retrieval client maps this to RetrievalException.
+export class SafeDnsError extends Error {
+  readonly hostname: string;
+  readonly targetUrl: string;
+  readonly reason: SafeDnsFailureReason;
+  readonly blockedAddress?: string;
+
+  constructor(
+    hostname: string,
+    targetUrl: string,
+    reason: SafeDnsFailureReason,
+    blockedAddress?: string,
+  ) {
+    super(
+      reason === 'blocked'
+        ? `Hostname "${hostname}" resolved to a blocked address.`
+        : `Hostname "${hostname}" could not be resolved.`,
+    );
+    this.name = new.target.name;
+    this.hostname = hostname;
+    this.targetUrl = targetUrl;
+    this.reason = reason;
+    this.blockedAddress = blockedAddress;
+
+    Error.captureStackTrace?.(this, new.target);
+  }
+}
+
+// Log-only URL form: keeps scheme/host/port/path, drops credentials, query,
+// and fragment. Never use for retrieval or failure provenance.
+export const sanitizeUrlForLogging = (rawUrl: string): string => {
+  try {
+    const parsed = new URL(rawUrl);
+    parsed.username = '';
+    parsed.password = '';
+    parsed.search = '';
+    parsed.hash = '';
+    return parsed.toString();
+  } catch {
+    return '[unparseable-url]';
+  }
+};
 
 type UrlSafetyServiceDependencies = {
   dnsResolver?: DnsResolver;
@@ -190,21 +235,22 @@ export class UrlSafetyService {
     return parsed;
   }
 
-  async assertHostAllowed(hostname: string, mode: RetrievalMode): Promise<void> {
-    if (mode === 'evaluation') {
-      return;
-    }
-
+  async assertHostAllowed(
+    hostname: string,
+    mode: RetrievalMode,
+    contextUrl?: string,
+  ): Promise<void> {
     const host = hostname
       .trim()
       .toLowerCase()
       .replace(/\.$/, '')
       .replace(/^\[(.*)\]$/, '$1');
+    const provenance = contextUrl ?? host;
 
     if (isIP(host) !== 0) {
-      if (isBlockedIpAddress(host)) {
+      if (mode !== 'evaluation' && isBlockedIpAddress(host)) {
         throw new RetrievalException('BLOCKED_ADDRESS', `IP literal "${host}" is blocked.`, {
-          url: host,
+          url: provenance,
         });
       }
 
@@ -212,27 +258,17 @@ export class UrlSafetyService {
     }
 
     if (!host) {
-      throw new RetrievalException('INVALID_URL', 'The URL hostname is empty.', { url: host });
+      throw new RetrievalException('INVALID_URL', 'The URL hostname is empty.', {
+        url: provenance,
+      });
     }
 
-    let addresses: string[];
+    // Both modes resolve: production also validates addresses, evaluation only
+    // classifies DNS failures while allowing local/private destinations.
+    const addresses = await this.resolveHost(host, provenance);
 
-    try {
-      addresses = await this.dnsResolver(host);
-    } catch (error) {
-      throw new RetrievalException(
-        'DNS_RESOLUTION_FAILED',
-        `Hostname "${host}" could not be resolved.`,
-        { url: host, cause: error },
-      );
-    }
-
-    if (addresses.length === 0) {
-      throw new RetrievalException(
-        'DNS_RESOLUTION_FAILED',
-        `Hostname "${host}" could not be resolved.`,
-        { url: host },
-      );
+    if (mode === 'evaluation') {
+      return;
     }
 
     // Conservative: any blocked address blocks the target (DNS rebinding).
@@ -241,7 +277,7 @@ export class UrlSafetyService {
         throw new RetrievalException(
           'BLOCKED_ADDRESS',
           `Hostname "${host}" resolves to a blocked address.`,
-          { url: host },
+          { url: provenance },
         );
       }
     }
@@ -251,8 +287,72 @@ export class UrlSafetyService {
   // through this again; never cache a "public once, public forever" verdict.
   async validateUrl(rawUrl: string, mode: RetrievalMode): Promise<URL> {
     const parsed = this.normalizeUrl(rawUrl);
-    await this.assertHostAllowed(parsed.hostname, mode);
+    await this.assertHostAllowed(parsed.hostname, mode, parsed.toString());
     return parsed;
+  }
+
+  // Connection-time lookup for http/https agents. The SAME validated address
+  // is handed to the socket, closing the pre-resolve/connect TOCTOU gap:
+  // Axios must never resolve independently of this policy.
+  createConnectionLookup(mode: RetrievalMode, targetUrl: string): LookupFunction {
+    return (hostname, options, callback) => {
+      void this.resolveHost(hostname, targetUrl)
+        .then((addresses) => {
+          if (mode !== 'evaluation') {
+            const blocked = addresses.find((address) => isBlockedIpAddress(address));
+
+            if (blocked) {
+              callback(new SafeDnsError(hostname, targetUrl, 'blocked', blocked), '');
+              return;
+            }
+          }
+
+          const familyOf = (address: string): number => (isIP(address) === 6 ? 6 : 4);
+
+          if (typeof options === 'object' && options.all) {
+            callback(
+              null,
+              addresses.map((address) => ({ address, family: familyOf(address) })),
+            );
+            return;
+          }
+
+          const first = addresses[0] ?? '';
+          callback(null, first, familyOf(first));
+        })
+        .catch((error: unknown) => {
+          callback(
+            error instanceof SafeDnsError
+              ? error
+              : new SafeDnsError(hostname, targetUrl, 'unresolved'),
+            '',
+          );
+        });
+    };
+  }
+
+  private async resolveHost(hostname: string, provenance: string): Promise<string[]> {
+    let addresses: string[];
+
+    try {
+      addresses = await this.dnsResolver(hostname);
+    } catch (error) {
+      throw new RetrievalException(
+        'DNS_RESOLUTION_FAILED',
+        `Hostname "${hostname}" could not be resolved.`,
+        { url: provenance, cause: error },
+      );
+    }
+
+    if (addresses.length === 0) {
+      throw new RetrievalException(
+        'DNS_RESOLUTION_FAILED',
+        `Hostname "${hostname}" could not be resolved.`,
+        { url: provenance },
+      );
+    }
+
+    return addresses;
   }
 
   private sanitizeForLogging(parsed: URL): string {

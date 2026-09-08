@@ -16,6 +16,9 @@ import { KitRepository } from '@/modules/kit/kit.repository';
 import { KitService } from '@/modules/kit/kit.service';
 import { RetrievalClient } from '@/modules/research/retrieval/retrieval-client.service';
 import { UrlSafetyService } from '@/modules/research/retrieval/url-safety.service';
+import { CompanyCrawlerService } from '@/modules/research/crawl/company-crawler.service';
+import { LinkDiscoveryService } from '@/modules/research/crawl/link-discovery.service';
+import { LinkRankingService } from '@/modules/research/crawl/link-ranking.service';
 import { UserModel } from '@/modules/user/user.model';
 import { UserRepository } from '@/modules/user/user.repository';
 import type { RequestHandler } from 'express';
@@ -37,6 +40,9 @@ export type AppContainer = {
   kitController: Provider<KitController>;
   urlSafetyService: Provider<UrlSafetyService>;
   retrievalClient: Provider<RetrievalClient>;
+  linkDiscoveryService: Provider<LinkDiscoveryService>;
+  linkRankingService: Provider<LinkRankingService>;
+  companyCrawlerService: Provider<CompanyCrawlerService>;
 };
 
 export const createAppContainer = (config: AppConfig): AppContainer => {
@@ -133,6 +139,20 @@ export const createAppContainer = (config: AppConfig): AppContainer => {
       }),
   );
 
+  const linkDiscoveryService = singleton(() => new LinkDiscoveryService());
+
+  const linkRankingService = singleton(() => new LinkRankingService());
+
+  const companyCrawlerService = singleton(
+    () =>
+      new CompanyCrawlerService({
+        retrievalClient: retrievalClient(),
+        linkDiscovery: linkDiscoveryService(),
+        linkRanking: linkRankingService(),
+        logger: logger(),
+      }),
+  );
+
   return {
     requestContext,
     logger,
@@ -150,5 +170,8 @@ export const createAppContainer = (config: AppConfig): AppContainer => {
     kitController,
     urlSafetyService,
     retrievalClient,
+    linkDiscoveryService,
+    linkRankingService,
+    companyCrawlerService,
   };
 };

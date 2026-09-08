@@ -1,4 +1,6 @@
 import axios, { type AxiosInstance } from 'axios';
+import { Agent as HttpAgent } from 'node:http';
+import { Agent as HttpsAgent } from 'node:https';
 import type { LoggerService } from '@/infrastructure/logger/logger.service';
 import {
   MAX_RETRIEVAL_BYTES,
@@ -13,17 +15,22 @@ import {
   RETRIEVAL_REDIRECT_STATUSES,
   RETRIEVAL_RETRYABLE_STATUSES,
   RETRIEVAL_TIMEOUT_MS,
+  RETRIEVAL_TOTAL_TIMEOUT_MS,
   RETRIEVAL_USER_AGENT,
 } from '@/modules/research/retrieval/retrieval.constants';
-import {
-  RetrievalException,
-  toRetrievalResult,
-  type RetrievedResource,
-  type RetrievalMode,
-  type RetrievalRequest,
-  type RetrievalResult,
+import { RetrievalException } from '@/modules/research/retrieval/retrieval.exception';
+import { toRetrievalResult } from '@/modules/research/retrieval/retrieval.failure';
+import type {
+  RetrievedResource,
+  RetrievalMode,
+  RetrievalRequest,
+  RetrievalResult,
 } from '@/modules/research/retrieval/retrieval.type';
-import type { UrlSafetyService } from '@/modules/research/retrieval/url-safety.service';
+import {
+  SafeDnsError,
+  sanitizeUrlForLogging,
+  type UrlSafetyService,
+} from '@/modules/research/retrieval/url-safety.service';
 
 export type RetrievalHttpResponse = {
   status: number;
@@ -31,11 +38,19 @@ export type RetrievalHttpResponse = {
   body: string;
 };
 
-export type HttpGetter = (url: string) => Promise<RetrievalHttpResponse>;
+export type HttpFetchContext = {
+  mode: RetrievalMode;
+  targetUrl: string;
+  timeoutMs: number;
+};
+
+export type HttpGetter = (url: string, context: HttpFetchContext) => Promise<RetrievalHttpResponse>;
 
 export type Sleep = (ms: number) => Promise<void>;
 
 export type RandomSource = () => number;
+
+export type Clock = () => number;
 
 type RetrievalClientDependencies = {
   urlSafety: UrlSafetyService;
@@ -43,6 +58,7 @@ type RetrievalClientDependencies = {
   httpGet?: HttpGetter;
   sleep?: Sleep;
   random?: RandomSource;
+  now?: Clock;
   timeoutMs?: number;
 };
 
@@ -111,6 +127,7 @@ export class RetrievalClient {
   private readonly httpGet: HttpGetter;
   private readonly sleep: Sleep;
   private readonly random: RandomSource;
+  private readonly now: Clock;
   private readonly timeoutMs: number;
 
   constructor(dependencies: RetrievalClientDependencies) {
@@ -118,6 +135,7 @@ export class RetrievalClient {
     this.logger = dependencies.logger;
     this.sleep = dependencies.sleep ?? defaultSleep;
     this.random = dependencies.random ?? Math.random;
+    this.now = dependencies.now ?? Date.now;
     this.timeoutMs = dependencies.timeoutMs ?? RETRIEVAL_TIMEOUT_MS;
     this.httpGet = dependencies.httpGet ?? this.createDefaultHttpGet();
   }
@@ -134,12 +152,12 @@ export class RetrievalClient {
       }
 
       this.logger.error(error, 'retrieval.unexpected_failure', {
-        url: this.sanitize(request.url),
+        url: sanitizeUrlForLogging(request.url),
       });
 
       return toRetrievalResult(
         new RetrievalException('NETWORK_ERROR', 'Unexpected retrieval failure.', {
-          url: this.sanitize(request.url),
+          url: sanitizeUrlForLogging(request.url),
           cause: error,
         }),
       );
@@ -148,24 +166,26 @@ export class RetrievalClient {
 
   private async fetchResource(request: RetrievalRequest): Promise<RetrievedResource> {
     const start = await this.urlSafety.validateUrl(request.url, request.mode);
+    const deadlineAt = this.now() + RETRIEVAL_TOTAL_TIMEOUT_MS;
+    const remainingMs = (): number => deadlineAt - this.now();
     let lastFailure: RetrievalException | null = null;
 
     for (let attempt = 1; attempt <= RETRIEVAL_MAX_ATTEMPTS; attempt += 1) {
-      const startedAt = Date.now();
+      const startedAt = this.now();
+      this.throwIfExpired(remainingMs(), start.toString());
 
       try {
-        const resource = await this.fetchOnce(start, request.mode, attempt);
-        return resource;
+        return await this.fetchOnce(start, request.mode, attempt, remainingMs);
       } catch (error) {
         const failure = this.normalizeTransportError(error, start.toString());
 
         this.logger.warn('retrieval.attempt_failed', {
-          url: this.sanitize(start.toString()),
+          url: sanitizeUrlForLogging(start.toString()),
           mode: request.mode,
           attempt,
           code: failure.code,
           ...(failure.status !== undefined ? { status: failure.status } : {}),
-          durationMs: Date.now() - startedAt,
+          durationMs: this.now() - startedAt,
         });
 
         if (!isRetryableException(failure) || attempt >= RETRIEVAL_MAX_ATTEMPTS) {
@@ -173,7 +193,9 @@ export class RetrievalClient {
         }
 
         lastFailure = failure;
-        await this.sleep(this.retryDelayMs(attempt - 1, failure));
+        await this.sleep(
+          this.boundedWaitMs(this.retryDelayMs(attempt - 1, failure), remainingMs(), failure.url),
+        );
       }
     }
 
@@ -185,25 +207,60 @@ export class RetrievalClient {
     );
   }
 
+  private throwIfExpired(remaining: number, url: string): void {
+    if (remaining <= 0) {
+      throw new RetrievalException('TIMEOUT', 'The total retrieval deadline was exceeded.', {
+        url,
+      });
+    }
+  }
+
+  // Never sleep past the remaining total budget; an exhausted budget surfaces
+  // as TIMEOUT instead of another wait.
+  private boundedWaitMs(waitMs: number, remaining: number, url: string): number {
+    if (remaining <= 0) {
+      throw new RetrievalException('TIMEOUT', 'The total retrieval deadline was exceeded.', {
+        url,
+      });
+    }
+
+    return Math.min(waitMs, remaining);
+  }
+
   // One attempt: manual redirect chain so every destination is revalidated.
   private async fetchOnce(
     start: URL,
     mode: RetrievalMode,
     attempt: number,
+    remainingMs: () => number,
   ): Promise<RetrievedResource> {
     let current = new URL(start.toString());
 
     for (let redirect = 0; ; redirect += 1) {
-      await this.urlSafety.assertHostAllowed(current.hostname, mode);
+      this.throwIfExpired(remainingMs(), current.toString());
+      await this.urlSafety.assertHostAllowed(current.hostname, mode, current.toString());
 
-      const startedAt = Date.now();
-      const response = await this.httpGet(current.toString());
+      const startedAt = this.now();
+      const hopTimeoutMs = Math.max(1, Math.min(this.timeoutMs, remainingMs()));
+      let response: RetrievalHttpResponse;
+
+      try {
+        response = await this.httpGet(current.toString(), {
+          mode,
+          targetUrl: current.toString(),
+          timeoutMs: hopTimeoutMs,
+        });
+      } catch (error) {
+        throw this.normalizeTransportError(error, current.toString());
+      }
+
+      this.throwIfExpired(remainingMs(), current.toString());
 
       this.logger.debug('retrieval.response', {
-        url: this.sanitize(current.toString()),
+        url: sanitizeUrlForLogging(current.toString()),
         attempt,
         status: response.status,
-        durationMs: Date.now() - startedAt,
+        durationMs: this.now() - startedAt,
       });
 
       if (RETRIEVAL_REDIRECT_STATUSES.has(response.status)) {
@@ -241,8 +298,8 @@ export class RetrievalClient {
         next.hash = '';
 
         this.logger.info('retrieval.redirect', {
-          url: this.sanitize(current.toString()),
-          destination: this.sanitize(next.toString()),
+          url: sanitizeUrlForLogging(current.toString()),
+          destination: sanitizeUrlForLogging(next.toString()),
           status: response.status,
         });
 
@@ -336,6 +393,16 @@ export class RetrievalClient {
       return error;
     }
 
+    const dnsError = findSafeDnsError(error);
+
+    if (dnsError) {
+      return new RetrievalException(
+        dnsError.reason === 'blocked' ? 'BLOCKED_ADDRESS' : 'DNS_RESOLUTION_FAILED',
+        dnsError.message,
+        { url: dnsError.targetUrl, cause: dnsError },
+      );
+    }
+
     if (axios.isAxiosError(error)) {
       const code = error.code ?? '';
 
@@ -410,21 +477,19 @@ export class RetrievalClient {
   }
 
   private createDefaultHttpGet(): HttpGetter {
-    const instance: AxiosInstance = axios.create({
-      timeout: this.timeoutMs,
-      maxRedirects: 0,
-      maxContentLength: MAX_RETRIEVAL_BYTES,
-      maxBodyLength: MAX_RETRIEVAL_BYTES,
-      responseType: 'text',
-      validateStatus: () => true,
-      headers: {
-        'User-Agent': RETRIEVAL_USER_AGENT,
-        Accept: RETRIEVAL_ACCEPT_HEADER,
-      },
-    });
+    const instance = createRetrievalAxiosInstance(this.timeoutMs);
 
-    return async (url: string): Promise<RetrievalHttpResponse> => {
-      const response = await instance.get(url);
+    return async (url: string, context: HttpFetchContext): Promise<RetrievalHttpResponse> => {
+      // Per-hop agents bind destination resolution to the connection-time
+      // policy lookup: the socket uses the validated address, never an
+      // independent second resolution.
+      const lookup = this.urlSafety.createConnectionLookup(context.mode, context.targetUrl);
+      const response = await instance.get(url, {
+        httpAgent: new HttpAgent({ lookup }),
+        httpsAgent: new HttpsAgent({ lookup }),
+        timeout: context.timeoutMs,
+        proxy: false,
+      });
       const data = response.data;
 
       return {
@@ -434,20 +499,36 @@ export class RetrievalClient {
       };
     };
   }
-
-  private sanitize(url: string): string {
-    try {
-      const parsed = new URL(url);
-
-      if (parsed.username || parsed.password) {
-        parsed.username = '[REDACTED]';
-        parsed.password = '';
-        return parsed.toString();
-      }
-
-      return parsed.toString();
-    } catch {
-      return '[unparseable-url]';
-    }
-  }
 }
+
+// Single Axios configuration for outbound retrieval. Implicit environment
+// proxying is disabled so destination resolution always stays under the
+// connection-time DNS policy above.
+export const createRetrievalAxiosInstance = (timeoutMs: number): AxiosInstance =>
+  axios.create({
+    timeout: timeoutMs,
+    maxRedirects: 0,
+    maxContentLength: MAX_RETRIEVAL_BYTES,
+    maxBodyLength: MAX_RETRIEVAL_BYTES,
+    responseType: 'text',
+    validateStatus: () => true,
+    proxy: false,
+    headers: {
+      'User-Agent': RETRIEVAL_USER_AGENT,
+      Accept: RETRIEVAL_ACCEPT_HEADER,
+    },
+  });
+
+// Walks the error/cause chain (Axios wraps socket errors) for a
+// connection-time policy rejection.
+const findSafeDnsError = (error: unknown, depth = 0): SafeDnsError | null => {
+  if (error instanceof SafeDnsError || depth > 4) {
+    return error instanceof SafeDnsError ? error : null;
+  }
+
+  if (typeof error === 'object' && error !== null && 'cause' in error) {
+    return findSafeDnsError((error as { cause?: unknown }).cause, depth + 1);
+  }
+
+  return null;
+};

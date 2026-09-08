@@ -23,6 +23,7 @@
   "dependencies": {
     "axios": "^1.20.0",
     "bcryptjs": "^3.0.2",
+    "cheerio": "^1.2.0",
     "compression": "^1.8.1",
     "connect-redis": "^9.0.0",
     "cors": "^2.8.5",
@@ -35,6 +36,7 @@
     "mongoose-paginate-v2": "^1.9.5",
     "pino": "^9.9.0",
     "redis": "^5.8.2",
+    "tldts": "^7.4.12",
     "zod": "^4.5.4"
   },
   "devDependencies": {
