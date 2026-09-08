@@ -10,6 +10,10 @@ import { createRequireAuthMiddleware } from '@/modules/auth/auth.middleware';
 import { AuthService } from '@/modules/auth/auth.service';
 import { PasswordService } from '@/modules/auth/password.service';
 import { HealthController } from '@/modules/health/health.controller';
+import { KitController } from '@/modules/kit/kit.controller';
+import { KitModel } from '@/modules/kit/kit.model';
+import { KitRepository } from '@/modules/kit/kit.repository';
+import { KitService } from '@/modules/kit/kit.service';
 import { UserModel } from '@/modules/user/user.model';
 import { UserRepository } from '@/modules/user/user.repository';
 import type { RequestHandler } from 'express';
@@ -26,6 +30,9 @@ export type AppContainer = {
   authService: Provider<AuthService>;
   authController: Provider<AuthController>;
   healthController: Provider<HealthController>;
+  kitRepository: Provider<KitRepository>;
+  kitService: Provider<KitService>;
+  kitController: Provider<KitController>;
 };
 
 export const createAppContainer = (config: AppConfig): AppContainer => {
@@ -89,6 +96,29 @@ export const createAppContainer = (config: AppConfig): AppContainer => {
 
   const healthController = singleton(() => new HealthController());
 
+  const kitRepository = singleton(
+    () =>
+      new KitRepository({
+        kitModel: KitModel,
+        logger: logger(),
+      }),
+  );
+
+  const kitService = singleton(
+    () =>
+      new KitService({
+        kitRepository: kitRepository(),
+        logger: logger(),
+      }),
+  );
+
+  const kitController = singleton(
+    () =>
+      new KitController({
+        kitService: kitService(),
+      }),
+  );
+
   return {
     requestContext,
     logger,
@@ -101,5 +131,8 @@ export const createAppContainer = (config: AppConfig): AppContainer => {
     authService,
     authController,
     healthController,
+    kitRepository,
+    kitService,
+    kitController,
   };
 };

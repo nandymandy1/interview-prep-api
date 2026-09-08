@@ -31,6 +31,7 @@
     "express-validator": "^7.2.1",
     "helmet": "^8.1.0",
     "mongoose": "^8.18.0",
+    "mongoose-paginate-v2": "^1.9.5",
     "pino": "^9.9.0",
     "redis": "^5.8.2",
     "zod": "^4.5.4"

@@ -1,4 +1,5 @@
 import { KitValidationException } from '@/common/errors/kit-validation.exception';
+import type { KitFlashcard, KitQuestion, KitRequirement } from '@/modules/kit/kit.type';
 import type {
   FlashcardDraft,
   KitIdSequences,
@@ -6,7 +7,6 @@ import type {
   RequirementDraft,
   StableIdPrefix,
 } from '@/modules/kit/kit-id.type';
-import type { KitFlashcard, KitQuestion, KitRequirement } from '@/modules/kit/kit.type';
 
 const sequenceKey: Record<StableIdPrefix, keyof KitIdSequences> = {
   r: 'requirement',
