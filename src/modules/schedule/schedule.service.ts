@@ -1,5 +1,6 @@
 import { KitValidationException } from '@/common/errors/kit-validation.exception';
 import { calculateCoverage } from '@/modules/coverage/coverage.service';
+import { questionSchema, requirementSchema } from '@/modules/kit/kit.schema';
 import type { KitQuestion, KitRequirement, KitScheduleDay } from '@/modules/kit/kit.type';
 import type {
   PreparedSchedule,
@@ -9,62 +10,63 @@ import type {
 
 const SCHEDULE_ALLOCATION_ERROR = 'SCHEDULE_ALLOCATION_ERROR';
 
-const requirementKinds = new Set(['technical', 'behavioural', 'domain']);
-const requirementPriorities = new Set(['must', 'nice']);
-const questionCategories = new Set(['technical', 'behavioural', 'system-design', 'company-fit']);
-const questionDifficulties = new Set([1, 2, 3]);
+type ScheduleMaterial = {
+  requirements: KitRequirement[];
+  questions: KitQuestion[];
+};
 
-const isMeaningful = (value: unknown): value is string =>
-  typeof value === 'string' && value.trim().length > 0;
+const parseRequirement = (value: unknown, index: number): KitRequirement => {
+  const parsed = requirementSchema.safeParse(value);
+  if (!parsed.success) {
+    throw new KitValidationException(`Scheduled requirement at index ${index} is invalid.`, {
+      details: parsed.error.flatten(),
+      cause: parsed.error,
+    });
+  }
+  return parsed.data;
+};
 
-// Material validation runs before any scoring so malformed generated-like
-// structures (duplicate IDs/refs, unknown refs, blank content) can never
-// influence schedule priority. Throws KitValidationException, never HTTP errors.
-const assertValidScheduleMaterial = (
-  requirements: readonly KitRequirement[],
-  questions: readonly KitQuestion[],
-): void => {
-  const requirementIds = new Set(requirements.map((requirement) => requirement.id));
-  if (requirementIds.size !== requirements.length) {
+const parseQuestion = (value: unknown, index: number): KitQuestion => {
+  const parsed = questionSchema.safeParse(value);
+  if (!parsed.success) {
+    throw new KitValidationException(`Scheduled question at index ${index} is invalid.`, {
+      details: parsed.error.flatten(),
+      cause: parsed.error,
+    });
+  }
+  return parsed.data;
+};
+
+// Canonical structural normalization first (Zod trims whitespace), then semantic
+// uniqueness/reference checks on the normalized structures. Schedule logic must
+// only ever consume the returned material, so whitespace-equivalent IDs cannot
+// bypass uniqueness and malformed data can never influence scoring.
+const parseScheduleMaterial = (
+  requirements: readonly unknown[],
+  questions: readonly unknown[],
+): ScheduleMaterial => {
+  const parsedRequirements = requirements.map((value, index) => parseRequirement(value, index));
+  const parsedQuestions = questions.map((value, index) => parseQuestion(value, index));
+  const requirementIds = new Set(parsedRequirements.map((requirement) => requirement.id));
+  if (requirementIds.size !== parsedRequirements.length) {
     throw new KitValidationException(
       'Duplicate requirement IDs are not allowed before scheduling.',
     );
   }
-  if (new Set(questions.map((question) => question.id)).size !== questions.length) {
-    throw new KitValidationException(
-      'Duplicate question IDs are not allowed before scheduling.',
-    );
+  if (new Set(parsedQuestions.map((question) => question.id)).size !== parsedQuestions.length) {
+    throw new KitValidationException('Duplicate question IDs are not allowed before scheduling.');
   }
-  for (const requirement of requirements) {
-    if (
-      !isMeaningful(requirement.id) ||
-      !isMeaningful(requirement.text) ||
-      !requirementKinds.has(requirement.kind) ||
-      !requirementPriorities.has(requirement.priority)
-    ) {
-      throw new KitValidationException('Scheduled requirements must have meaningful content.');
-    }
-  }
-  for (const question of questions) {
+  for (const question of parsedQuestions) {
     if (new Set(question.requirement_ids).size !== question.requirement_ids.length) {
       throw new KitValidationException(
         `Duplicate requirement references are not allowed before scheduling.`,
       );
     }
-    if (
-      !isMeaningful(question.id) ||
-      !question.requirement_ids.every(isMeaningful) ||
-      !questionCategories.has(question.category) ||
-      !isMeaningful(question.prompt) ||
-      !isMeaningful(question.answer_outline) ||
-      !questionDifficulties.has(question.difficulty) ||
-      question.requirement_ids.some((id) => !requirementIds.has(id))
-    ) {
-      throw new KitValidationException(
-        'Scheduled questions must have valid references, category, and difficulty.',
-      );
+    if (question.requirement_ids.some((id) => !requirementIds.has(id))) {
+      throw new KitValidationException('Scheduled question references an unknown requirement.');
     }
   }
+  return { requirements: parsedRequirements, questions: parsedQuestions };
 };
 
 const questionScore = (
@@ -112,17 +114,17 @@ export const allocateSchedule = ({
       code: SCHEDULE_ALLOCATION_ERROR,
     });
   }
-  assertValidScheduleMaterial(requirements, questions);
+  const material = parseScheduleMaterial(requirements, questions);
 
   const requirementsById = new Map(
-    requirements.map((requirement) => [requirement.id, requirement]),
+    material.requirements.map((requirement) => [requirement.id, requirement]),
   );
-  const questionsById = new Map(questions.map((question) => [question.id, question]));
+  const questionsById = new Map(material.questions.map((question) => [question.id, question]));
 
-  for (const requirement of requirements) {
+  for (const requirement of material.requirements) {
     if (
       requirement.priority === 'must' &&
-      !questions.some((question) => question.requirement_ids.includes(requirement.id))
+      !material.questions.some((question) => question.requirement_ids.includes(requirement.id))
     ) {
       throw new KitValidationException(
         `Must-have requirement ${requirement.id} has no covering question.`,
@@ -137,7 +139,7 @@ export const allocateSchedule = ({
     question_ids: [],
     minutes: 0,
   }));
-  const prioritizedQuestions = [...questions].sort((left, right) => {
+  const prioritizedQuestions = [...material.questions].sort((left, right) => {
     const scoreDifference =
       questionScore(right, requirementsById) - questionScore(left, requirementsById);
     return scoreDifference || left.id.localeCompare(right.id, undefined, { numeric: true });
@@ -176,7 +178,7 @@ export const allocateSchedule = ({
 // Deterministic pipeline order: validate material → coverage → schedule.
 // Final kit validation runs later on the assembled InterviewKit.
 export const prepareSchedule = (input: ScheduleInput): PreparedSchedule => {
-  assertValidScheduleMaterial(input.requirements, input.questions);
-  const coverage = calculateCoverage(input.requirements, input.questions);
+  const material = parseScheduleMaterial(input.requirements, input.questions);
+  const coverage = calculateCoverage(material.requirements, material.questions);
   return { coverage, schedule: allocateSchedule(input) };
 };

@@ -2,14 +2,19 @@ import { Schema, model, type HydratedDocument } from 'mongoose';
 
 export type User = {
   email: string;
-  passwordHash: string;
   createdAt: Date;
   updatedAt: Date;
 };
 
+export type AuthenticationUser = User & {
+  passwordHash: string;
+};
+
 export type UserDocument = HydratedDocument<User>;
 
-const userSchema = new Schema<User>(
+export type AuthenticationUserDocument = HydratedDocument<AuthenticationUser>;
+
+const userSchema = new Schema<AuthenticationUser>(
   {
     email: {
       type: String,
@@ -31,4 +36,4 @@ const userSchema = new Schema<User>(
   },
 );
 
-export const UserModel = model<User>('User', userSchema);
+export const UserModel = model<AuthenticationUser>('User', userSchema);

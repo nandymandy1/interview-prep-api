@@ -84,14 +84,34 @@ describe('stable kit IDs', () => {
 
   it('sequential allocation: q1 → q2 → q3', () => {
     const sequences = createInitialSequences();
-    expect(allocateQuestionIds(
-      [
-        { requirement_ids: [], category: 'technical', prompt: 'A', answer_outline: 'B', difficulty: 1 },
-        { requirement_ids: [], category: 'technical', prompt: 'B', answer_outline: 'B', difficulty: 1 },
-        { requirement_ids: [], category: 'technical', prompt: 'C', answer_outline: 'B', difficulty: 1 },
-      ],
-      sequences,
-    ).map((q) => q.id)).toEqual(['q1', 'q2', 'q3']);
+    expect(
+      allocateQuestionIds(
+        [
+          {
+            requirement_ids: [],
+            category: 'technical',
+            prompt: 'A',
+            answer_outline: 'B',
+            difficulty: 1,
+          },
+          {
+            requirement_ids: [],
+            category: 'technical',
+            prompt: 'B',
+            answer_outline: 'B',
+            difficulty: 1,
+          },
+          {
+            requirement_ids: [],
+            category: 'technical',
+            prompt: 'C',
+            answer_outline: 'B',
+            difficulty: 1,
+          },
+        ],
+        sequences,
+      ).map((q) => q.id),
+    ).toEqual(['q1', 'q2', 'q3']);
     expect(sequences.question).toBe(3);
   });
 
@@ -130,7 +150,11 @@ describe('stable kit IDs', () => {
 
   it('retained lifecycle covers requirement and flashcard counters', () => {
     const sequences = createInitialSequences();
-    const requirement = (text: string) => ({ text, kind: 'technical' as const, priority: 'must' as const });
+    const requirement = (text: string) => ({
+      text,
+      kind: 'technical' as const,
+      priority: 'must' as const,
+    });
     const flashcard = (front: string) => ({ front, back: 'B', requirement_ids: [] as string[] });
     expect(
       allocateRequirementIds([requirement('A'), requirement('B')], sequences).map((r) => r.id),
@@ -151,15 +175,34 @@ describe('stable kit IDs', () => {
     expect(allocateStableId(sequences, 'r')).toBe('r2');
   });
 
+  it('accepts zero and normal positive safe-integer counters', () => {
+    const sequences: KitIdSequences = { requirement: 0, question: 41, flashcard: 0 };
+    expect(allocateStableId(sequences, 'q')).toBe('q42');
+    expect(allocateStableId(sequences, 'r')).toBe('r1');
+  });
+
   it.each([
     ['NaN', { requirement: Number.NaN, question: 0, flashcard: 0 }],
     ['Infinity', { requirement: 0, question: Number.POSITIVE_INFINITY, flashcard: 0 }],
     ['negative', { requirement: 0, question: 0, flashcard: -1 }],
     ['fractional', { requirement: 1.5, question: 0, flashcard: 0 }],
+    ['unsafe integer', { requirement: 0, question: Number.MAX_SAFE_INTEGER + 1, flashcard: 0 }],
   ])('rejects %s sequence counters', (_name, sequences) => {
     expect(() => allocateStableId(sequences as KitIdSequences, 'q')).toThrow(
       KitValidationException,
     );
+  });
+
+  it('cannot increment Number.MAX_SAFE_INTEGER', () => {
+    const sequences: KitIdSequences = {
+      requirement: 0,
+      question: Number.MAX_SAFE_INTEGER,
+      flashcard: 0,
+    };
+    expect(() => allocateStableId(sequences, 'q')).toThrow(
+      'Kit ID sequence has reached its maximum safe value.',
+    );
+    expect(sequences.question).toBe(Number.MAX_SAFE_INTEGER);
   });
 
   it('deterministic input/state produces deterministic IDs across repeated allocate calls', () => {
@@ -167,8 +210,20 @@ describe('stable kit IDs', () => {
       const seq = createInitialSequences();
       return allocateQuestionIds(
         [
-          { requirement_ids: [], category: 'technical', prompt: 'A', answer_outline: 'B', difficulty: 1 },
-          { requirement_ids: [], category: 'behavioural', prompt: 'B', answer_outline: 'B', difficulty: 2 },
+          {
+            requirement_ids: [],
+            category: 'technical',
+            prompt: 'A',
+            answer_outline: 'B',
+            difficulty: 1,
+          },
+          {
+            requirement_ids: [],
+            category: 'behavioural',
+            prompt: 'B',
+            answer_outline: 'B',
+            difficulty: 2,
+          },
         ],
         seq,
       ).map((q) => q.id);
@@ -187,7 +242,10 @@ describe('stable kit IDs', () => {
       seq1,
     );
     expect(first.map((r) => r.id)).toEqual(['r1', 'r2']);
-    const second = allocateRequirementIds([{ text: 'C', kind: 'technical', priority: 'must' }], seq1);
+    const second = allocateRequirementIds(
+      [{ text: 'C', kind: 'technical', priority: 'must' }],
+      seq1,
+    );
     expect(second.map((r) => r.id)).toEqual(['r3']);
   });
 });
@@ -276,8 +334,83 @@ describe('schedule allocation', () => {
   it('prepareSchedule validates material, then computes coverage, then schedules', () => {
     const prepared = prepareSchedule({ requirements, questions, daysAvailable: 2 });
     expect(prepared.coverage).toEqual({ uncovered_requirement_ids: [] });
-    expect(prepared.schedule).toEqual(allocateSchedule({ requirements, questions, daysAvailable: 2 }));
+    expect(prepared.schedule).toEqual(
+      allocateSchedule({ requirements, questions, daysAvailable: 2 }),
+    );
     expect(prepared.schedule.days).toHaveLength(2);
+  });
+
+  it('rejects whitespace-equivalent requirement IDs as duplicates', () => {
+    const input = {
+      requirements: [...requirements, { ...requirements[0]!, id: ' r1 ' }],
+      questions,
+      daysAvailable: 1,
+    };
+    expect(() => allocateSchedule(input)).toThrow('Duplicate requirement IDs');
+    expect(() => prepareSchedule(input)).toThrow(KitValidationException);
+  });
+
+  it('rejects whitespace-equivalent question IDs as duplicates', () => {
+    const input = {
+      requirements,
+      questions: [...questions, { ...questions[0]!, id: ' q1 ' }],
+      daysAvailable: 1,
+    };
+    expect(() => allocateSchedule(input)).toThrow('Duplicate question IDs');
+    expect(() => prepareSchedule(input)).toThrow(KitValidationException);
+  });
+
+  it('normalizes a padded requirement ref when the canonical ID exists', () => {
+    const padded = { ...questions[0]!, id: ' q1 ', requirement_ids: [' r1 '] };
+    const schedule = allocateSchedule({
+      requirements,
+      questions: [padded, questions[1]!, questions[2]!],
+      daysAvailable: 1,
+    });
+    const scheduled = schedule.days.flatMap((day) => day.question_ids);
+    expect(scheduled).toContain('q1');
+    expect(scheduled).not.toContain(' q1 ');
+  });
+
+  it('rejects duplicate normalized nested refs', () => {
+    const input = {
+      requirements,
+      questions: [
+        { ...questions[0]!, requirement_ids: ['r1', ' r1 '] },
+        questions[1]!,
+        questions[2]!,
+      ],
+      daysAvailable: 1,
+    };
+    expect(() => allocateSchedule(input)).toThrow('Duplicate');
+    expect(() => prepareSchedule(input)).toThrow(KitValidationException);
+  });
+
+  it.each([
+    ['invalid category', { ...questions[0]!, category: 'bogus' } as unknown as KitQuestion],
+    ['invalid difficulty', { ...questions[0]!, difficulty: 9 } as unknown as KitQuestion],
+  ])('rejects %s before scoring', (_name, question) => {
+    const input = {
+      requirements,
+      questions: [question, questions[1]!, questions[2]!],
+      daysAvailable: 1,
+    };
+    expect(() => allocateSchedule(input)).toThrow(KitValidationException);
+    expect(() => prepareSchedule(input)).toThrow(KitValidationException);
+  });
+
+  it('rejects unknown normalized requirement references before scoring', () => {
+    const input = {
+      requirements,
+      questions: [
+        { ...questions[0]!, requirement_ids: [' missing '] },
+        questions[1]!,
+        questions[2]!,
+      ],
+      daysAvailable: 1,
+    };
+    expect(() => allocateSchedule(input)).toThrow(KitValidationException);
+    expect(() => prepareSchedule(input)).toThrow(KitValidationException);
   });
 
   it('keeps lower-priority questions after higher-priority questions instead of wrapping them early', () => {
@@ -296,9 +429,9 @@ describe('schedule allocation', () => {
   it('keeps open review for days without scheduled questions', () => {
     const schedule = allocateSchedule({ requirements, questions, daysAvailable: 5 });
     expect(schedule.days).toHaveLength(5);
-    expect(schedule.days.filter((day) => day.question_ids.length === 0).map((day) => day.focus)).toEqual(
-      ['Open review', 'Open review'],
-    );
+    expect(
+      schedule.days.filter((day) => day.question_ids.length === 0).map((day) => day.focus),
+    ).toEqual(['Open review', 'Open review']);
     expect(schedule.days.every((day) => day.focus.trim().length > 0)).toBe(true);
   });
 });
@@ -313,6 +446,40 @@ describe('InterviewKit validation', () => {
     draft.coverage.passes = 0;
     expect(() => validateFinalInterviewKit(draft)).toThrow(KitValidationException);
     expect(validateFinalInterviewKit(createKit())).toEqual(createKit());
+  });
+
+  it('rejects a vacuous final kit with zero requirements', () => {
+    const kit = createKit();
+    kit.role.requirements = [];
+    kit.questions = [];
+    kit.flashcards = [];
+    kit.schedule = {
+      days_available: 1,
+      days: [{ day: 1, focus: 'Practice', question_ids: [], minutes: 0 }],
+    };
+    kit.coverage = { uncovered_requirement_ids: [], passes: 1 };
+
+    expect(validateInterviewKit(kit)).toEqual(kit);
+    expect(() => validateFinalInterviewKit(kit)).toThrow(
+      'Final interview kit must contain at least one requirement.',
+    );
+  });
+
+  it('rejects a vacuous final kit with zero questions', () => {
+    const kit = createKit();
+    kit.role.requirements = [{ id: 'r1', text: 'TypeScript', kind: 'technical', priority: 'nice' }];
+    kit.questions = [];
+    kit.flashcards = [];
+    kit.schedule = {
+      days_available: 1,
+      days: [{ day: 1, focus: 'Practice', question_ids: [], minutes: 0 }],
+    };
+    kit.coverage = { uncovered_requirement_ids: [], passes: 1 };
+
+    expect(validateInterviewKit(kit)).toEqual(kit);
+    expect(() => validateFinalInterviewKit(kit)).toThrow(
+      'Final interview kit must contain at least one question.',
+    );
   });
 
   it('rejects incomplete must-have coverage for final kits while base validation passes', () => {
@@ -476,21 +643,36 @@ describe('InterviewKit validation', () => {
   });
 
   it.each([
-    ['blank responsibility', (kit: InterviewKit) => {
-      kit.role.responsibilities = ['   '];
-    }],
-    ['blank brief source', (kit: InterviewKit) => {
-      kit.company_brief.sources = [''];
-    }],
-    ['blank page used', (kit: InterviewKit) => {
-      kit.source.pages_used = ['  '];
-    }],
-    ['blank requirement ref', (kit: InterviewKit) => {
-      kit.questions[0]!.requirement_ids = [' '];
-    }],
-    ['blank scheduled question', (kit: InterviewKit) => {
-      kit.schedule.days[0]!.question_ids = [''];
-    }],
+    [
+      'blank responsibility',
+      (kit: InterviewKit) => {
+        kit.role.responsibilities = ['   '];
+      },
+    ],
+    [
+      'blank brief source',
+      (kit: InterviewKit) => {
+        kit.company_brief.sources = [''];
+      },
+    ],
+    [
+      'blank page used',
+      (kit: InterviewKit) => {
+        kit.source.pages_used = ['  '];
+      },
+    ],
+    [
+      'blank requirement ref',
+      (kit: InterviewKit) => {
+        kit.questions[0]!.requirement_ids = [' '];
+      },
+    ],
+    [
+      'blank scheduled question',
+      (kit: InterviewKit) => {
+        kit.schedule.days[0]!.question_ids = [''];
+      },
+    ],
   ])('rejects %s', (_name, mutate) => {
     const kit = createKit();
     mutate(kit);
@@ -498,7 +680,10 @@ describe('InterviewKit validation', () => {
   });
 
   it('rejects editor/lifecycle metadata inside the canonical kit', () => {
-    const withTopLevel = { ...createKit(), sequences: { requirement: 3, question: 3, flashcard: 1 } };
+    const withTopLevel = {
+      ...createKit(),
+      sequences: { requirement: 3, question: 3, flashcard: 1 },
+    };
     expect(() => validateInterviewKit(withTopLevel)).toThrow(KitValidationException);
     const withPinned = createKit();
     (withPinned.questions[0] as unknown as Record<string, unknown>)['pinned'] = true;

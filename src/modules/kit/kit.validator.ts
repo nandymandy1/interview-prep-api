@@ -77,6 +77,12 @@ export const validateInterviewKit = (value: unknown): InterviewKit => {
 // orchestration must translate it into retry/repair handling instead.
 export const validateFinalInterviewKit = (value: unknown): InterviewKit => {
   const kit = validateInterviewKit(value);
+  if (kit.role.requirements.length < 1) {
+    throw new KitValidationException('Final interview kit must contain at least one requirement.');
+  }
+  if (kit.questions.length < 1) {
+    throw new KitValidationException('Final interview kit must contain at least one question.');
+  }
   if (kit.coverage.passes < 1 || kit.coverage.uncovered_requirement_ids.length > 0) {
     throw new KitValidationException(
       'Final interview kit must have completed coverage with no uncovered requirements.',
@@ -89,11 +95,23 @@ export const validateFinalInterviewKit = (value: unknown): InterviewKit => {
       .filter((question) => scheduledQuestionIds.has(question.id))
       .flatMap((question) => question.requirement_ids),
   );
-  if (kit.role.requirements.some((requirement) => requirement.priority === 'must' && !scheduledRequirementIds.has(requirement.id))) {
-    throw new KitValidationException('Final interview kit must schedule every must-have requirement.');
+  if (
+    kit.role.requirements.some(
+      (requirement) =>
+        requirement.priority === 'must' && !scheduledRequirementIds.has(requirement.id),
+    )
+  ) {
+    throw new KitValidationException(
+      'Final interview kit must schedule every must-have requirement.',
+    );
   }
-  if (scheduledQuestionIds.size !== scheduledQuestionIdList.length || scheduledQuestionIds.size !== kit.questions.length) {
-    throw new KitValidationException('Final interview kit must schedule every question exactly once.');
+  if (
+    scheduledQuestionIds.size !== scheduledQuestionIdList.length ||
+    scheduledQuestionIds.size !== kit.questions.length
+  ) {
+    throw new KitValidationException(
+      'Final interview kit must schedule every question exactly once.',
+    );
   }
   return kit;
 };

@@ -16,13 +16,20 @@ type AuthServiceDependencies = {
   logger: LoggerService;
 };
 
-// Narrow race detection: only the Mongo duplicate-key shape normalizes to 409.
-// The users collection has a single unique index (email), so code 11000 from
-// user creation is the concurrent-registration race, not an unrelated failure.
-const isMongoDuplicateKeyError = (error: unknown): boolean =>
-  typeof error === 'object' &&
-  error !== null &&
-  (error as { code?: unknown }).code === 11000;
+// Narrow race detection: code 11000 alone is not enough, since any future unique
+// index throws it too. Only email-keyed duplicates normalize to 409, using the
+// stable structured fields instead of message substring matching.
+const hasEmailKey = (value: unknown): boolean =>
+  typeof value === 'object' &&
+  value !== null &&
+  (value as Record<string, unknown>)['email'] !== undefined;
+
+export const isDuplicateEmailKeyError = (error: unknown): boolean => {
+  if (typeof error !== 'object' || error === null) return false;
+  const candidate = error as { code?: unknown; keyPattern?: unknown; keyValue?: unknown };
+  if (candidate.code !== 11000) return false;
+  return hasEmailKey(candidate.keyPattern) || hasEmailKey(candidate.keyValue);
+};
 
 export class AuthService {
   constructor(private readonly dependencies: AuthServiceDependencies) {}
@@ -39,7 +46,7 @@ export class AuthService {
     try {
       user = await this.dependencies.userRepository.create(input.email, passwordHash);
     } catch (error) {
-      if (isMongoDuplicateKeyError(error)) {
+      if (isDuplicateEmailKeyError(error)) {
         this.dependencies.logger.debug('auth.user.register.conflict_race');
         throw new ConflictException('An account with this email already exists');
       }

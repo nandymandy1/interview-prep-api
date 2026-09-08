@@ -1,0 +1,11 @@
+node_modules
+dist
+build
+coverage
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
+.graphify
+graphify-out
+graphify_out

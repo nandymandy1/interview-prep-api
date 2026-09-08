@@ -32,17 +32,9 @@ export const createAuthRouter = ({
     wrapRoute(authController, 'login', 'auth.login'),
   );
 
-  router.post(
-    '/logout',
-    requireAuth,
-    wrapRoute(authController, 'logout', 'auth.logout'),
-  );
+  router.post('/logout', requireAuth, wrapRoute(authController, 'logout', 'auth.logout'));
 
-  router.get(
-    '/me',
-    requireAuth,
-    wrapRoute(authController, 'me', 'auth.me'),
-  );
+  router.get('/me', requireAuth, wrapRoute(authController, 'me', 'auth.me'));
 
   return router;
 };

@@ -17,11 +17,8 @@ describe('validation middleware', () => {
     const app = express();
 
     app.use(express.json());
-    app.post(
-      '/validate',
-      body('email').isEmail(),
-      validationMiddleware,
-      (_req, res) => res.status(200).json({ success: true }),
+    app.post('/validate', body('email').isEmail(), validationMiddleware, (_req, res) =>
+      res.status(200).json({ success: true }),
     );
     app.use(createErrorHandlerMiddleware(logger));
 

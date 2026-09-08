@@ -1,10 +1,5 @@
 import { performance } from 'node:perf_hooks';
-import type {
-  NextFunction,
-  Request,
-  RequestHandler,
-  Response,
-} from 'express';
+import type { NextFunction, Request, RequestHandler, Response } from 'express';
 import type { Provider } from '@/common/providers/provider';
 import type { LoggerService } from '@/infrastructure/logger/logger.service';
 import { normalizeHttpException, sendErrorResponse } from '@/common/errors/error-response';
@@ -29,7 +24,8 @@ type WrapRouteDependencies = {
   logger: LoggerService;
 };
 
-export const createWrapRoute = ({ logger }: WrapRouteDependencies): WrapRoute =>
+export const createWrapRoute =
+  ({ logger }: WrapRouteDependencies): WrapRoute =>
   <T, K extends RouteMethodKey<T>>(
     provider: Provider<T>,
     methodName: K,
@@ -74,5 +70,4 @@ export const createWrapRoute = ({ logger }: WrapRouteDependencies): WrapRoute =>
     }
   };
 
-const roundDuration = (durationMs: number): number =>
-  Math.round(durationMs * 100) / 100;
+const roundDuration = (durationMs: number): number => Math.round(durationMs * 100) / 100;

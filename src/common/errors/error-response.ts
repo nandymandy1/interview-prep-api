@@ -19,8 +19,7 @@ export const normalizeHttpException = (error: unknown): HttpException => {
   }
 
   if (isStatusLikeError(error)) {
-    const candidateStatus =
-      typeof error.statusCode === 'number' ? error.statusCode : error.status;
+    const candidateStatus = typeof error.statusCode === 'number' ? error.statusCode : error.status;
 
     if (
       typeof candidateStatus === 'number' &&

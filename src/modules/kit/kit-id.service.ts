@@ -16,9 +16,15 @@ const sequenceKey: Record<StableIdPrefix, keyof KitIdSequences> = {
 
 const assertValidSequences = (sequences: KitIdSequences): void => {
   for (const value of Object.values(sequences)) {
-    if (!Number.isInteger(value) || value < 0) {
+    if (!Number.isSafeInteger(value) || value < 0) {
       throw new KitValidationException('Kit ID sequences must be non-negative integers.');
     }
+  }
+};
+
+const assertIncrementable = (counter: number): void => {
+  if (counter >= Number.MAX_SAFE_INTEGER) {
+    throw new KitValidationException('Kit ID sequence has reached its maximum safe value.');
   }
 };
 
@@ -28,12 +34,10 @@ export const createInitialSequences = (): KitIdSequences => ({
   flashcard: 0,
 });
 
-export const allocateStableId = (
-  sequences: KitIdSequences,
-  prefix: StableIdPrefix,
-): string => {
+export const allocateStableId = (sequences: KitIdSequences, prefix: StableIdPrefix): string => {
   assertValidSequences(sequences);
   const key = sequenceKey[prefix];
+  assertIncrementable(sequences[key]);
   sequences[key] += 1;
   return `${prefix}${sequences[key]}`;
 };

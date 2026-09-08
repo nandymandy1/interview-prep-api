@@ -11,11 +11,7 @@ export class HttpException extends Error {
   readonly details?: unknown;
   readonly expose: boolean;
 
-  constructor(
-    statusCode: number,
-    message: string,
-    options: HttpExceptionOptions = {},
-  ) {
+  constructor(statusCode: number, message: string, options: HttpExceptionOptions = {}) {
     super(message, { cause: options.cause });
     this.name = new.target.name;
     this.statusCode = statusCode;
@@ -51,7 +47,6 @@ export class NotFoundException extends HttpException {
   }
 }
 
-
 export class MethodNotAllowedException extends HttpException {
   constructor(message = 'Method not allowed') {
     super(405, message, { code: 'METHOD_NOT_ALLOWED' });
@@ -69,7 +64,6 @@ export class ConflictException extends HttpException {
     super(409, message, { code: 'CONFLICT', details });
   }
 }
-
 
 export class PayloadTooLargeException extends HttpException {
   constructor(message = 'Payload too large') {
@@ -104,7 +98,6 @@ export class InternalServerException extends HttpException {
     });
   }
 }
-
 
 export class BadGatewayException extends HttpException {
   constructor(cause?: unknown) {

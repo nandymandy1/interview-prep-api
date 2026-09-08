@@ -1,19 +1,20 @@
 import type { Request, Response } from 'express';
 import type { Model } from 'mongoose';
 import { describe, expect, it, vi } from 'vitest';
-import {
-  ConflictException,
-  UnauthorizedException,
-} from '@/common/errors/http-exception';
+import { ConflictException, UnauthorizedException } from '@/common/errors/http-exception';
 import type { LoggerService } from '@/infrastructure/logger/logger.service';
 import { AuthController } from '@/modules/auth/auth.controller';
 import { AuthService } from '@/modules/auth/auth.service';
 import type { PasswordService } from '@/modules/auth/password.service';
-import type { User, UserDocument } from '@/modules/user/user.model';
+import type {
+  AuthenticationUser,
+  AuthenticationUserDocument,
+  User,
+  UserDocument,
+} from '@/modules/user/user.model';
 import { UserRepository } from '@/modules/user/user.repository';
 
-const logger = () =>
-  ({ info: vi.fn(), debug: vi.fn() }) as unknown as LoggerService;
+const logger = () => ({ info: vi.fn(), debug: vi.fn() }) as unknown as LoggerService;
 
 const userRepository = () =>
   ({
@@ -47,7 +48,9 @@ const storedUser = (overrides: Partial<User> = {}) =>
 describe('user lookup hash selection', () => {
   it('findByEmail does not select passwordHash', async () => {
     const select = vi.fn();
-    const model = { findOne: vi.fn().mockReturnValue({ select }) } as unknown as Model<User>;
+    const model = {
+      findOne: vi.fn().mockReturnValue({ select }),
+    } as unknown as Model<AuthenticationUser>;
     const repository = new UserRepository({ userModel: model, logger: logger() });
 
     await repository.findByEmail('A@B.c');
@@ -59,12 +62,30 @@ describe('user lookup hash selection', () => {
   it('findByEmailForAuthentication explicitly selects passwordHash', async () => {
     const user = storedUser();
     const select = vi.fn().mockReturnValue(user);
-    const model = { findOne: vi.fn().mockReturnValue({ select }) } as unknown as Model<User>;
+    const model = {
+      findOne: vi.fn().mockReturnValue({ select }),
+    } as unknown as Model<AuthenticationUser>;
     const repository = new UserRepository({ userModel: model, logger: logger() });
 
     await expect(repository.findByEmailForAuthentication('A@B.c')).resolves.toBe(user);
     expect(model.findOne).toHaveBeenCalledWith({ email: 'a@b.c' });
     expect(select).toHaveBeenCalledWith('+passwordHash');
+  });
+});
+
+describe('user return-type boundary', () => {
+  it('ordinary user documents do not guarantee passwordHash', () => {
+    const user: UserDocument = storedUser();
+    // @ts-expect-error passwordHash is only guaranteed on authentication documents
+    void user.passwordHash;
+    const email: string = user.email;
+    expect(email).toBe('a@b.c');
+  });
+
+  it('authentication documents guarantee passwordHash', () => {
+    const user: AuthenticationUserDocument = storedUser() as unknown as AuthenticationUserDocument;
+    const hash: string = user.passwordHash;
+    expect(hash).toBe('hash');
   });
 });
 
@@ -160,6 +181,49 @@ describe('auth service lookups', () => {
       .catch((error: unknown) => error);
     expect(error).toBeInstanceOf(ConflictException);
     expect((error as ConflictException).statusCode).toBe(409);
+  });
+
+  it('email keyValue duplicate-key race maps to 409', async () => {
+    const repository = userRepository();
+    repository.findByEmail.mockResolvedValue(null);
+    repository.create.mockRejectedValue({
+      code: 11000,
+      keyValue: { email: 'a@b.c' },
+      message: 'E11000 duplicate key error',
+    });
+    const service = new AuthService({
+      userRepository: repository,
+      passwordService: { hash: vi.fn().mockResolvedValue('hash') } as unknown as PasswordService,
+      logger: logger(),
+    });
+
+    const error = await service
+      .register({ email: 'a@b.c', password: 'secret' })
+      .catch((error: unknown) => error);
+    expect(error).toBeInstanceOf(ConflictException);
+    expect((error as ConflictException).statusCode).toBe(409);
+  });
+
+  it('non-email duplicate-key errors are not converted to email conflict', async () => {
+    const repository = userRepository();
+    repository.findByEmail.mockResolvedValue(null);
+    repository.create.mockRejectedValue({
+      code: 11000,
+      keyPattern: { username: 1 },
+      keyValue: { username: 'taken' },
+      message: 'E11000 duplicate key error',
+    });
+    const service = new AuthService({
+      userRepository: repository,
+      passwordService: { hash: vi.fn().mockResolvedValue('hash') } as unknown as PasswordService,
+      logger: logger(),
+    });
+
+    const error = await service
+      .register({ email: 'a@b.c', password: 'secret' })
+      .catch((error: unknown) => error);
+    expect(error).not.toBeInstanceOf(ConflictException);
+    expect((error as { code?: unknown }).code).toBe(11000);
   });
 
   it('unrelated database errors are not mislabeled 409', async () => {

@@ -46,10 +46,7 @@ export class LoggerService {
   }
 
   error(error: unknown, message: string, meta: LogMeta = {}): void {
-    this.dependencies.baseLogger.error(
-      this.withContext({ ...meta, err: error }),
-      message,
-    );
+    this.dependencies.baseLogger.error(this.withContext({ ...meta, err: error }), message);
   }
 
   private withContext(meta: LogMeta): LogMeta {

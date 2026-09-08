@@ -2,9 +2,8 @@ import type { ErrorRequestHandler } from 'express';
 import type { LoggerService } from '@/infrastructure/logger/logger.service';
 import { normalizeHttpException, sendErrorResponse } from '@/common/errors/error-response';
 
-export const createErrorHandlerMiddleware = (
-  logger: LoggerService,
-): ErrorRequestHandler =>
+export const createErrorHandlerMiddleware =
+  (logger: LoggerService): ErrorRequestHandler =>
   (error, _req, res, next): void => {
     if (res.headersSent) {
       next(error);

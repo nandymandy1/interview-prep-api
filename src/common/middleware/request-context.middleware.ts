@@ -9,10 +9,8 @@ type RequestContextMiddlewareDependencies = {
   logger: LoggerService;
 };
 
-export const createRequestContextMiddleware = ({
-  requestContext,
-  logger,
-}: RequestContextMiddlewareDependencies): RequestHandler =>
+export const createRequestContextMiddleware =
+  ({ requestContext, logger }: RequestContextMiddlewareDependencies): RequestHandler =>
   (req, res, next): void => {
     const requestId = req.header('x-request-id')?.trim() || randomUUID();
     const startedAt = performance.now();
@@ -50,5 +48,4 @@ export const createRequestContextMiddleware = ({
     );
   };
 
-const roundDuration = (durationMs: number): number =>
-  Math.round(durationMs * 100) / 100;
+const roundDuration = (durationMs: number): number => Math.round(durationMs * 100) / 100;

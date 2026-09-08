@@ -7,9 +7,7 @@ export type RouterDependencies = {
   health: HealthRouterDependencies;
 };
 
-export const createRouterDependencies = (
-  container: AppContainer,
-): RouterDependencies => ({
+export const createRouterDependencies = (container: AppContainer): RouterDependencies => ({
   auth: {
     authController: container.authController,
     wrapRoute: container.wrapRoute(),

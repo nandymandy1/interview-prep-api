@@ -11,10 +11,7 @@ import { createSessionMiddleware } from '@/infrastructure/session/session.middle
 import { createRouterDependencies } from '@/routes/router-dependencies';
 import { registerRoutes } from '@/routes';
 
-export const createApp = (
-  config: AppConfig,
-  container: AppContainer,
-): Express => {
+export const createApp = (config: AppConfig, container: AppContainer): Express => {
   const app = express();
   const logger = container.logger();
   const requestContext = container.requestContext();

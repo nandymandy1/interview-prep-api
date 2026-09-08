@@ -6,9 +6,8 @@ type RequireAuthDependencies = {
   requestContext: RequestContextService;
 };
 
-export const createRequireAuthMiddleware = ({
-  requestContext,
-}: RequireAuthDependencies): RequestHandler =>
+export const createRequireAuthMiddleware =
+  ({ requestContext }: RequireAuthDependencies): RequestHandler =>
   (req, _res, next): void => {
     const userId = req.session.userId;
 

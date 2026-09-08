@@ -72,13 +72,31 @@ describe('wrapRoute internal error handling', () => {
 
 describe('safe 5xx public messages', () => {
   it.each([
-    ['BadGatewayException', new BadGatewayException(new Error('provider said X')), 502, 'Bad gateway'],
-    ['ServiceUnavailableException', new ServiceUnavailableException(new Error('downstream Y')), 503, 'Service unavailable'],
-    ['GatewayTimeoutException', new GatewayTimeoutException(new Error('timed out Z')), 504, 'Gateway timeout'],
-  ])('%s exposes a fixed message and keeps the cause internal', (_name, error, statusCode, message) => {
-    expect(error.statusCode).toBe(statusCode);
-    expect(error.message).toBe(message);
-    expect(error.expose).toBe(true);
-    expect(error.cause).toBeInstanceOf(Error);
-  });
+    [
+      'BadGatewayException',
+      new BadGatewayException(new Error('provider said X')),
+      502,
+      'Bad gateway',
+    ],
+    [
+      'ServiceUnavailableException',
+      new ServiceUnavailableException(new Error('downstream Y')),
+      503,
+      'Service unavailable',
+    ],
+    [
+      'GatewayTimeoutException',
+      new GatewayTimeoutException(new Error('timed out Z')),
+      504,
+      'Gateway timeout',
+    ],
+  ])(
+    '%s exposes a fixed message and keeps the cause internal',
+    (_name, error, statusCode, message) => {
+      expect(error.statusCode).toBe(statusCode);
+      expect(error.message).toBe(message);
+      expect(error.expose).toBe(true);
+      expect(error.cause).toBeInstanceOf(Error);
+    },
+  );
 });

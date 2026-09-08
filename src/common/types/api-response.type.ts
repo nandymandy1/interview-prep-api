@@ -4,8 +4,10 @@ export type ApiSuccessResponse<T> = {
   data?: T;
 };
 
-export type ApiResponse<T> = ApiSuccessResponse<T> | {
-  success: false;
-  message: string;
-  details?: unknown;
-};
+export type ApiResponse<T> =
+  | ApiSuccessResponse<T>
+  | {
+      success: false;
+      message: string;
+      details?: unknown;
+    };

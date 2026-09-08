@@ -1,9 +1,13 @@
 import type { Model } from 'mongoose';
 import type { LoggerService } from '@/infrastructure/logger/logger.service';
-import type { User, UserDocument } from '@/modules/user/user.model';
+import type {
+  AuthenticationUser,
+  AuthenticationUserDocument,
+  UserDocument,
+} from '@/modules/user/user.model';
 
 type UserRepositoryDependencies = {
-  userModel: Model<User>;
+  userModel: Model<AuthenticationUser>;
   logger: LoggerService;
 };
 
@@ -24,10 +28,11 @@ export class UserRepository {
   }
 
   async findByEmail(email: string): Promise<UserDocument | null> {
-    return this.dependencies.userModel.findOne({ email: email.toLowerCase() });
+    const user = await this.dependencies.userModel.findOne({ email: email.toLowerCase() });
+    return user as unknown as UserDocument | null;
   }
 
-  async findByEmailForAuthentication(email: string): Promise<UserDocument | null> {
+  async findByEmailForAuthentication(email: string): Promise<AuthenticationUserDocument | null> {
     return this.dependencies.userModel
       .findOne({ email: email.toLowerCase() })
       .select('+passwordHash');
