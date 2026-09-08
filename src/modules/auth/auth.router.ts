@@ -1,9 +1,9 @@
 import { Router, type RequestHandler } from 'express';
-import type { Provider } from '../../common/providers/provider';
-import type { WrapRoute } from '../../common/http/wrap-route';
-import { validationMiddleware } from '../../common/middleware/validation.middleware';
-import type { AuthController } from './auth.controller';
-import { loginValidator, registerValidator } from './auth.validator';
+import type { Provider } from '@/common/providers/provider';
+import type { WrapRoute } from '@/common/http/wrap-route';
+import { validationMiddleware } from '@/common/middleware/validation.middleware';
+import type { AuthController } from '@/modules/auth/auth.controller';
+import { loginValidator, registerValidator } from '@/modules/auth/auth.validator';
 
 export type AuthRouterDependencies = {
   authController: Provider<AuthController>;

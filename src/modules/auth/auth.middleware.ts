@@ -1,6 +1,6 @@
 import type { RequestHandler } from 'express';
-import type { RequestContextService } from '../../common/context/request-context.service';
-import { UnauthorizedException } from '../../common/errors/http-exception';
+import type { RequestContextService } from '@/common/context/request-context.service';
+import { UnauthorizedException } from '@/common/errors/http-exception';
 
 type RequireAuthDependencies = {
   requestContext: RequestContextService;

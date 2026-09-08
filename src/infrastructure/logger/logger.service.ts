@@ -1,5 +1,5 @@
 import pino, { type Logger } from 'pino';
-import type { RequestContextService } from '../../common/context/request-context.service';
+import type { RequestContextService } from '@/common/context/request-context.service';
 
 export type LogMeta = Record<string, unknown>;
 

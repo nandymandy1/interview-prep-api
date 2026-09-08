@@ -1,5 +1,5 @@
 import type { Response } from 'express';
-import { HttpException, InternalServerException } from './http-exception';
+import { HttpException, InternalServerException } from '@/common/errors/http-exception';
 
 export type ApiErrorResponse = {
   success: false;

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { singleton } from '../src/common/providers/provider';
+import { singleton } from '@/common/providers/provider';
 
 describe('singleton provider', () => {
   it('is lazy and returns the same instance after first resolution', () => {

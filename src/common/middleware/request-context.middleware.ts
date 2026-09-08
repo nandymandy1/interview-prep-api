@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import type { RequestHandler } from 'express';
-import type { RequestContextService } from '../context/request-context.service';
-import type { LoggerService } from '../../infrastructure/logger/logger.service';
+import type { RequestContextService } from '@/common/context/request-context.service';
+import type { LoggerService } from '@/infrastructure/logger/logger.service';
 
 type RequestContextMiddlewareDependencies = {
   requestContext: RequestContextService;

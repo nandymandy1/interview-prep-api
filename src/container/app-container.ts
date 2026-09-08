@@ -1,17 +1,17 @@
-import { RequestContextService } from '../common/context/request-context.service';
-import { createWrapRoute, type WrapRoute } from '../common/http/wrap-route';
-import { singleton, type Provider } from '../common/providers/provider';
-import type { AppConfig } from '../config/app.config';
-import { createBaseLogger, LoggerService } from '../infrastructure/logger/logger.service';
-import { MongoDatabaseService } from '../infrastructure/database/mongo-database.service';
-import { RedisService } from '../infrastructure/redis/redis.service';
-import { AuthController } from '../modules/auth/auth.controller';
-import { createRequireAuthMiddleware } from '../modules/auth/auth.middleware';
-import { AuthService } from '../modules/auth/auth.service';
-import { PasswordService } from '../modules/auth/password.service';
-import { HealthController } from '../modules/health/health.controller';
-import { UserModel } from '../modules/user/user.model';
-import { UserRepository } from '../modules/user/user.repository';
+import { RequestContextService } from '@/common/context/request-context.service';
+import { createWrapRoute, type WrapRoute } from '@/common/http/wrap-route';
+import { singleton, type Provider } from '@/common/providers/provider';
+import type { AppConfig } from '@/config/app.config';
+import { createBaseLogger, LoggerService } from '@/infrastructure/logger/logger.service';
+import { MongoDatabaseService } from '@/infrastructure/database/mongo-database.service';
+import { RedisService } from '@/infrastructure/redis/redis.service';
+import { AuthController } from '@/modules/auth/auth.controller';
+import { createRequireAuthMiddleware } from '@/modules/auth/auth.middleware';
+import { AuthService } from '@/modules/auth/auth.service';
+import { PasswordService } from '@/modules/auth/password.service';
+import { HealthController } from '@/modules/health/health.controller';
+import { UserModel } from '@/modules/user/user.model';
+import { UserRepository } from '@/modules/user/user.repository';
 import type { RequestHandler } from 'express';
 
 export type AppContainer = {

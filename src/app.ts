@@ -2,14 +2,14 @@ import compression from 'compression';
 import cors from 'cors';
 import express, { type Express } from 'express';
 import helmet from 'helmet';
-import type { AppConfig } from './config/app.config';
-import type { AppContainer } from './container/app-container';
-import { createRequestContextMiddleware } from './common/middleware/request-context.middleware';
-import { notFoundMiddleware } from './common/middleware/not-found.middleware';
-import { createErrorHandlerMiddleware } from './common/middleware/error-handler.middleware';
-import { createSessionMiddleware } from './infrastructure/session/session.middleware';
-import { createRouterDependencies } from './routes/router-dependencies';
-import { registerRoutes } from './routes';
+import type { AppConfig } from '@/config/app.config';
+import type { AppContainer } from '@/container/app-container';
+import { createRequestContextMiddleware } from '@/common/middleware/request-context.middleware';
+import { notFoundMiddleware } from '@/common/middleware/not-found.middleware';
+import { createErrorHandlerMiddleware } from '@/common/middleware/error-handler.middleware';
+import { createSessionMiddleware } from '@/infrastructure/session/session.middleware';
+import { createRouterDependencies } from '@/routes/router-dependencies';
+import { registerRoutes } from '@/routes';
 
 export const createApp = (
   config: AppConfig,

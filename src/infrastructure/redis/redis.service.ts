@@ -1,5 +1,5 @@
 import { createClient, type RedisClientType } from 'redis';
-import type { LoggerService } from '../logger/logger.service';
+import type { LoggerService } from '@/infrastructure/logger/logger.service';
 
 type RedisServiceDependencies = {
   url: string;

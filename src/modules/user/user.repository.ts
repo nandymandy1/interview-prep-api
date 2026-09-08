@@ -1,6 +1,6 @@
 import type { Model } from 'mongoose';
-import type { LoggerService } from '../../infrastructure/logger/logger.service';
-import type { User, UserDocument } from './user.model';
+import type { LoggerService } from '@/infrastructure/logger/logger.service';
+import type { User, UserDocument } from '@/modules/user/user.model';
 
 type UserRepositoryDependencies = {
   userModel: Model<User>;

@@ -1,8 +1,8 @@
 import type { Request, Response } from 'express';
-import type { ApiSuccessResponse } from '../../common/types/api-response.type';
-import type { AuthResult } from './auth.type';
-import type { AuthService } from './auth.service';
-import { UnauthorizedException } from '../../common/errors/http-exception';
+import type { ApiSuccessResponse } from '@/common/types/api-response.type';
+import type { AuthResult } from '@/modules/auth/auth.type';
+import type { AuthService } from '@/modules/auth/auth.service';
+import { UnauthorizedException } from '@/common/errors/http-exception';
 
 type AuthControllerDependencies = {
   authService: AuthService;

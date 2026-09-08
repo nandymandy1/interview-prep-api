@@ -5,9 +5,9 @@ import type {
   RequestHandler,
   Response,
 } from 'express';
-import type { Provider } from '../providers/provider';
-import type { LoggerService } from '../../infrastructure/logger/logger.service';
-import { normalizeHttpException, sendErrorResponse } from '../errors/error-response';
+import type { Provider } from '@/common/providers/provider';
+import type { LoggerService } from '@/infrastructure/logger/logger.service';
+import { normalizeHttpException, sendErrorResponse } from '@/common/errors/error-response';
 
 export type ControllerRouteMethod = (
   req: Request,

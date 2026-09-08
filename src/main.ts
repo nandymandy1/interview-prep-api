@@ -1,7 +1,7 @@
 import { createServer } from 'node:http';
-import { createApp } from './app';
-import { loadAppConfig } from './config/app.config';
-import { createAppContainer } from './container/app-container';
+import { createApp } from '@/app';
+import { loadAppConfig } from '@/config/app.config';
+import { createAppContainer } from '@/container/app-container';
 
 const bootstrap = async (): Promise<void> => {
   const config = loadAppConfig();

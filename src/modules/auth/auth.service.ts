@@ -2,13 +2,13 @@ import {
   ConflictException,
   NotFoundException,
   UnauthorizedException,
-} from '../../common/errors/http-exception';
-import type { LoggerService } from '../../infrastructure/logger/logger.service';
-import type { UserDocument } from '../user/user.model';
-import type { UserRepository } from '../user/user.repository';
-import type { PublicUser } from '../user/user.type';
-import type { AuthResult, LoginInput, RegisterInput } from './auth.type';
-import type { PasswordService } from './password.service';
+} from '@/common/errors/http-exception';
+import type { LoggerService } from '@/infrastructure/logger/logger.service';
+import type { UserDocument } from '@/modules/user/user.model';
+import type { UserRepository } from '@/modules/user/user.repository';
+import type { PublicUser } from '@/modules/user/user.type';
+import type { AuthResult, LoginInput, RegisterInput } from '@/modules/auth/auth.type';
+import type { PasswordService } from '@/modules/auth/password.service';
 
 type AuthServiceDependencies = {
   userRepository: UserRepository;

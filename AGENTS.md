@@ -21,6 +21,7 @@ This repository is an Express.js + TypeScript backend. Keep Express explicit; us
 13. Use `LoggerService`; do not use `console.*` after bootstrap.
 14. Never log passwords, cookies, authorization headers, session ids, API keys, or other secrets.
 15. Add focused tests for behavior that is worth protecting.
+16. Use `@/…` for every internal module import and export; `@/*` resolves to `src/*`. Relative paths are reserved for non-module assets only.
 
 ## Dependency reuse
 

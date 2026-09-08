@@ -1,2 +1,2 @@
-export * from './http-exception';
-export * from './error-response';
+export * from '@/common/errors/http-exception';
+export * from '@/common/errors/error-response';

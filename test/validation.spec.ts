@@ -2,10 +2,10 @@ import express from 'express';
 import request from 'supertest';
 import { body } from 'express-validator';
 import { describe, expect, it } from 'vitest';
-import { validationMiddleware } from '../src/common/middleware/validation.middleware';
-import { createErrorHandlerMiddleware } from '../src/common/middleware/error-handler.middleware';
-import { RequestContextService } from '../src/common/context/request-context.service';
-import { createBaseLogger, LoggerService } from '../src/infrastructure/logger/logger.service';
+import { validationMiddleware } from '@/common/middleware/validation.middleware';
+import { createErrorHandlerMiddleware } from '@/common/middleware/error-handler.middleware';
+import { RequestContextService } from '@/common/context/request-context.service';
+import { createBaseLogger, LoggerService } from '@/infrastructure/logger/logger.service';
 
 describe('validation middleware', () => {
   it('returns a 400 structured error when express-validator rejects input', async () => {

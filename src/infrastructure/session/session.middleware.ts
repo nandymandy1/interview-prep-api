@@ -1,7 +1,7 @@
 import session, { type SessionOptions } from 'express-session';
 import { RedisStore } from 'connect-redis';
 import type { RedisClientType } from 'redis';
-import type { AppConfig } from '../../config/app.config';
+import type { AppConfig } from '@/config/app.config';
 
 export const createSessionMiddleware = (
   redisClient: RedisClientType,

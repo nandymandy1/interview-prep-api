@@ -1,7 +1,7 @@
 import type { Express } from 'express';
-import type { RouterDependencies } from './router-dependencies';
-import { createAuthRouter } from '../modules/auth/auth.router';
-import { createHealthRouter } from '../modules/health/health.router';
+import type { RouterDependencies } from '@/routes/router-dependencies';
+import { createAuthRouter } from '@/modules/auth/auth.router';
+import { createHealthRouter } from '@/modules/health/health.router';
 
 export const registerRoutes = (
   app: Express,

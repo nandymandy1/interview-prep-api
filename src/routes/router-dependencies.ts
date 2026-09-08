@@ -1,6 +1,6 @@
-import type { AppContainer } from '../container/app-container';
-import type { AuthRouterDependencies } from '../modules/auth/auth.router';
-import type { HealthRouterDependencies } from '../modules/health/health.router';
+import type { AppContainer } from '@/container/app-container';
+import type { AuthRouterDependencies } from '@/modules/auth/auth.router';
+import type { HealthRouterDependencies } from '@/modules/health/health.router';
 
 export type RouterDependencies = {
   auth: AuthRouterDependencies;

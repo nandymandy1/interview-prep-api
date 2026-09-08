@@ -1,7 +1,7 @@
 import { Router } from 'express';
-import type { Provider } from '../../common/providers/provider';
-import type { WrapRoute } from '../../common/http/wrap-route';
-import type { HealthController } from './health.controller';
+import type { Provider } from '@/common/providers/provider';
+import type { WrapRoute } from '@/common/http/wrap-route';
+import type { HealthController } from '@/modules/health/health.controller';
 
 export type HealthRouterDependencies = {
   healthController: Provider<HealthController>;

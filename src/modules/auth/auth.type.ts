@@ -1,4 +1,4 @@
-import type { PublicUser } from '../user/user.type';
+import type { PublicUser } from '@/modules/user/user.type';
 
 export type RegisterInput = {
   email: string;

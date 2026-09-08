@@ -1,6 +1,6 @@
 import type { ErrorRequestHandler } from 'express';
-import type { LoggerService } from '../../infrastructure/logger/logger.service';
-import { normalizeHttpException, sendErrorResponse } from '../errors/error-response';
+import type { LoggerService } from '@/infrastructure/logger/logger.service';
+import { normalizeHttpException, sendErrorResponse } from '@/common/errors/error-response';
 
 export const createErrorHandlerMiddleware = (
   logger: LoggerService,

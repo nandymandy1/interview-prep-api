@@ -1,11 +1,11 @@
 import express from 'express';
 import request from 'supertest';
 import { describe, expect, it } from 'vitest';
-import { BadRequestException } from '../src/common/errors/http-exception';
-import { RequestContextService } from '../src/common/context/request-context.service';
-import { createBaseLogger, LoggerService } from '../src/infrastructure/logger/logger.service';
-import { createWrapRoute } from '../src/common/http/wrap-route';
-import { singleton } from '../src/common/providers/provider';
+import { BadRequestException } from '@/common/errors/http-exception';
+import { RequestContextService } from '@/common/context/request-context.service';
+import { createBaseLogger, LoggerService } from '@/infrastructure/logger/logger.service';
+import { createWrapRoute } from '@/common/http/wrap-route';
+import { singleton } from '@/common/providers/provider';
 
 class TestController {
   async fail(): Promise<void> {

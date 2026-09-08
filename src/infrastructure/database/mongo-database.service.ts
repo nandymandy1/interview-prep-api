@@ -1,5 +1,5 @@
 import mongoose from 'mongoose';
-import type { LoggerService } from '../logger/logger.service';
+import type { LoggerService } from '@/infrastructure/logger/logger.service';
 
 type MongoDatabaseServiceDependencies = {
   uri: string;
