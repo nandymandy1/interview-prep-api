@@ -14,6 +14,8 @@ import { KitController } from '@/modules/kit/kit.controller';
 import { KitModel } from '@/modules/kit/kit.model';
 import { KitRepository } from '@/modules/kit/kit.repository';
 import { KitService } from '@/modules/kit/kit.service';
+import { RetrievalClient } from '@/modules/research/retrieval/retrieval-client.service';
+import { UrlSafetyService } from '@/modules/research/retrieval/url-safety.service';
 import { UserModel } from '@/modules/user/user.model';
 import { UserRepository } from '@/modules/user/user.repository';
 import type { RequestHandler } from 'express';
@@ -33,6 +35,8 @@ export type AppContainer = {
   kitRepository: Provider<KitRepository>;
   kitService: Provider<KitService>;
   kitController: Provider<KitController>;
+  urlSafetyService: Provider<UrlSafetyService>;
+  retrievalClient: Provider<RetrievalClient>;
 };
 
 export const createAppContainer = (config: AppConfig): AppContainer => {
@@ -119,6 +123,16 @@ export const createAppContainer = (config: AppConfig): AppContainer => {
       }),
   );
 
+  const urlSafetyService = singleton(() => new UrlSafetyService());
+
+  const retrievalClient = singleton(
+    () =>
+      new RetrievalClient({
+        urlSafety: urlSafetyService(),
+        logger: logger(),
+      }),
+  );
+
   return {
     requestContext,
     logger,
@@ -134,5 +148,7 @@ export const createAppContainer = (config: AppConfig): AppContainer => {
     kitRepository,
     kitService,
     kitController,
+    urlSafetyService,
+    retrievalClient,
   };
 };
