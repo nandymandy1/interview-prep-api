@@ -17,7 +17,7 @@ export class AuthController {
       password: String(req.body.password),
     });
 
-    req.session.userId = result.user.id;
+    await this.establishSession(req, result.user.id);
 
     const response: ApiSuccessResponse<AuthResult> = {
       success: true,
@@ -33,7 +33,7 @@ export class AuthController {
       password: String(req.body.password),
     });
 
-    req.session.userId = result.user.id;
+    await this.establishSession(req, result.user.id);
 
     const response: ApiSuccessResponse<AuthResult> = {
       success: true,
@@ -72,6 +72,19 @@ export class AuthController {
     res.status(200).json({
       success: true,
       data: { user },
+    });
+  }
+
+  private async establishSession(req: Request, userId: string): Promise<void> {
+    await new Promise<void>((resolve, reject) => {
+      req.session.regenerate((regenerateError) => {
+        if (regenerateError) {
+          reject(regenerateError);
+          return;
+        }
+        req.session.userId = userId;
+        req.session.save((saveError) => (saveError ? reject(saveError) : resolve()));
+      });
     });
   }
 }

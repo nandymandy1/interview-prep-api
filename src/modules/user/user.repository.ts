@@ -24,9 +24,13 @@ export class UserRepository {
   }
 
   async findByEmail(email: string): Promise<UserDocument | null> {
-    return this.dependencies.userModel.findOne({
-      email: email.toLowerCase(),
-    });
+    return this.dependencies.userModel.findOne({ email: email.toLowerCase() });
+  }
+
+  async findByEmailForAuthentication(email: string): Promise<UserDocument | null> {
+    return this.dependencies.userModel
+      .findOne({ email: email.toLowerCase() })
+      .select('+passwordHash');
   }
 
   async findById(id: string): Promise<UserDocument | null> {

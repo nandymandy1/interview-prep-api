@@ -22,6 +22,7 @@ This repository is an Express.js + TypeScript backend. Keep Express explicit; us
 14. Never log passwords, cookies, authorization headers, session ids, API keys, or other secrets.
 15. Add focused tests for behavior that is worth protecting.
 16. Use `@/…` for every internal module import and export; `@/*` resolves to `src/*`. Relative paths are reserved for non-module assets only.
+17. Use Zod for structured domain and generated-data validation. Keep `express-validator` for HTTP request middleware; do not add hand-written object-shape guards for new schemas.
 
 ## Dependency reuse
 

@@ -16,6 +16,14 @@ type AuthServiceDependencies = {
   logger: LoggerService;
 };
 
+// Narrow race detection: only the Mongo duplicate-key shape normalizes to 409.
+// The users collection has a single unique index (email), so code 11000 from
+// user creation is the concurrent-registration race, not an unrelated failure.
+const isMongoDuplicateKeyError = (error: unknown): boolean =>
+  typeof error === 'object' &&
+  error !== null &&
+  (error as { code?: unknown }).code === 11000;
+
 export class AuthService {
   constructor(private readonly dependencies: AuthServiceDependencies) {}
 
@@ -27,7 +35,16 @@ export class AuthService {
     }
 
     const passwordHash = await this.dependencies.passwordService.hash(input.password);
-    const user = await this.dependencies.userRepository.create(input.email, passwordHash);
+    let user: UserDocument;
+    try {
+      user = await this.dependencies.userRepository.create(input.email, passwordHash);
+    } catch (error) {
+      if (isMongoDuplicateKeyError(error)) {
+        this.dependencies.logger.debug('auth.user.register.conflict_race');
+        throw new ConflictException('An account with this email already exists');
+      }
+      throw error;
+    }
 
     this.dependencies.logger.info('auth.user.registered', {
       userId: user.id,
@@ -37,7 +54,7 @@ export class AuthService {
   }
 
   async login(input: LoginInput): Promise<AuthResult> {
-    const user = await this.dependencies.userRepository.findByEmail(input.email);
+    const user = await this.dependencies.userRepository.findByEmailForAuthentication(input.email);
 
     if (!user) {
       throw new UnauthorizedException('Invalid email or password');

@@ -20,7 +20,7 @@ export const createSessionMiddleware = (
       httpOnly: true,
       maxAge: 1000 * 60 * 60 * 24 * 7,
       secure: config.nodeEnv === 'production',
-      sameSite: config.nodeEnv === 'production' ? 'none' : 'lax',
+      sameSite: 'lax',
     },
   };
 

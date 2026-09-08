@@ -107,8 +107,8 @@ export class InternalServerException extends HttpException {
 
 
 export class BadGatewayException extends HttpException {
-  constructor(message = 'Bad gateway', cause?: unknown) {
-    super(502, message, {
+  constructor(cause?: unknown) {
+    super(502, 'Bad gateway', {
       code: 'BAD_GATEWAY',
       expose: true,
       cause,
@@ -117,8 +117,8 @@ export class BadGatewayException extends HttpException {
 }
 
 export class ServiceUnavailableException extends HttpException {
-  constructor(message = 'Service unavailable', cause?: unknown) {
-    super(503, message, {
+  constructor(cause?: unknown) {
+    super(503, 'Service unavailable', {
       code: 'SERVICE_UNAVAILABLE',
       expose: true,
       cause,
@@ -127,8 +127,8 @@ export class ServiceUnavailableException extends HttpException {
 }
 
 export class GatewayTimeoutException extends HttpException {
-  constructor(message = 'Gateway timeout', cause?: unknown) {
-    super(504, message, {
+  constructor(cause?: unknown) {
+    super(504, 'Gateway timeout', {
       code: 'GATEWAY_TIMEOUT',
       expose: true,
       cause,

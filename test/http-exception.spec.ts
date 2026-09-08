@@ -1,7 +1,12 @@
 import express from 'express';
 import request from 'supertest';
 import { describe, expect, it } from 'vitest';
-import { BadRequestException } from '@/common/errors/http-exception';
+import {
+  BadGatewayException,
+  BadRequestException,
+  GatewayTimeoutException,
+  ServiceUnavailableException,
+} from '@/common/errors/http-exception';
 import { RequestContextService } from '@/common/context/request-context.service';
 import { createBaseLogger, LoggerService } from '@/infrastructure/logger/logger.service';
 import { createWrapRoute } from '@/common/http/wrap-route';
@@ -62,5 +67,18 @@ describe('wrapRoute internal error handling', () => {
       success: false,
       message: 'Internal server error',
     });
+  });
+});
+
+describe('safe 5xx public messages', () => {
+  it.each([
+    ['BadGatewayException', new BadGatewayException(new Error('provider said X')), 502, 'Bad gateway'],
+    ['ServiceUnavailableException', new ServiceUnavailableException(new Error('downstream Y')), 503, 'Service unavailable'],
+    ['GatewayTimeoutException', new GatewayTimeoutException(new Error('timed out Z')), 504, 'Gateway timeout'],
+  ])('%s exposes a fixed message and keeps the cause internal', (_name, error, statusCode, message) => {
+    expect(error.statusCode).toBe(statusCode);
+    expect(error.message).toBe(message);
+    expect(error.expose).toBe(true);
+    expect(error.cause).toBeInstanceOf(Error);
   });
 });

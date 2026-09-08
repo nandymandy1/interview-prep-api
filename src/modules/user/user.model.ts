@@ -22,7 +22,7 @@ const userSchema = new Schema<User>(
     passwordHash: {
       type: String,
       required: true,
-      select: true,
+      select: false,
     },
   },
   {
