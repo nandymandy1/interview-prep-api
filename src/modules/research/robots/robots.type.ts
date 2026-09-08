@@ -14,6 +14,8 @@ export type RobotsPolicy = {
 export type RobotsOriginStatus = {
   origin: string;
   status: RobotsPolicyState;
+  httpStatus?: number;
+  failureCode?: RetrievalFailureCode;
 };
 
 export type RobotsPolicyCache = Map<string, RobotsPolicy>;

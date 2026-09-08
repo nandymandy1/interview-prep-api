@@ -14,7 +14,11 @@ export type CrawlTruncationReason =
   'page-request-limit' | 'depth-limit' | 'deadline' | 'candidate-limit';
 
 export type CrawlSkipReason =
-  'ROBOTS_DISALLOWED' | 'ROBOTS_UNAVAILABLE' | 'ORIGIN_LIMIT' | 'OUT_OF_SCOPE';
+  | 'ROBOTS_DISALLOWED'
+  | 'ROBOTS_UNAVAILABLE'
+  | 'ORIGIN_LIMIT'
+  | 'OUT_OF_SCOPE'
+  | 'OUT_OF_SCOPE_REDIRECT';
 
 export type CrawlSkip = {
   url: string;

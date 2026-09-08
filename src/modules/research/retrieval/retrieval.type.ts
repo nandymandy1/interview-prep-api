@@ -1,8 +1,17 @@
 export type RetrievalMode = 'production' | 'evaluation';
 
+// Caller redirect policy: invoked after the redirect target passes shape and
+// DNS/address validation but BEFORE the next request is performed. May throw
+// RedirectBlockedError to abort the redirect; the rejection propagates to the
+// retrieve() caller instead of becoming a RetrievalResult.
+export type RedirectGuard = (next: URL, from: URL) => Promise<void>;
+
+export type RedirectBlockReason = 'ROBOTS_DISALLOWED' | 'OUT_OF_SCOPE';
+
 export type RetrievalRequest = {
   url: string;
   mode: RetrievalMode;
+  onBeforeRedirect?: RedirectGuard;
 };
 
 export type RetrievedResource = {

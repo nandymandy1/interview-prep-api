@@ -11,6 +11,7 @@ export type AppConfig = {
   sessionSecret: string;
   sessionCookieName: string;
   logLevel: string;
+  braveSearchApiKey?: string;
 };
 
 const required = (name: string): string => {
@@ -58,5 +59,8 @@ export const loadAppConfig = (): AppConfig => {
     sessionSecret,
     sessionCookieName: process.env.SESSION_COOKIE_NAME?.trim() || 'interview_prep.sid',
     logLevel: process.env.LOG_LEVEL?.trim() || 'info',
+    // Optional degradable integration: public discussion research reports
+    // SEARCH_PROVIDER_NOT_CONFIGURED when absent and never blocks boot.
+    braveSearchApiKey: process.env.BRAVE_SEARCH_API_KEY?.trim() || undefined,
   };
 };

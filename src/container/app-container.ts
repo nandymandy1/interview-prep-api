@@ -21,6 +21,9 @@ import { LinkDiscoveryService } from '@/modules/research/crawl/link-discovery.se
 import { LinkRankingService } from '@/modules/research/crawl/link-ranking.service';
 import { RobotsPolicyService } from '@/modules/research/robots/robots-policy.service';
 import { PageExtractionService } from '@/modules/research/extraction/page-extraction.service';
+import { BraveSearchProvider } from '@/modules/research/search/brave-search.provider';
+import type { PublicSearchProvider } from '@/modules/research/search/search.type';
+import { PublicDiscussionResearchService } from '@/modules/research/discussion/public-discussion-research.service';
 import { UserModel } from '@/modules/user/user.model';
 import { UserRepository } from '@/modules/user/user.repository';
 import type { RequestHandler } from 'express';
@@ -47,6 +50,8 @@ export type AppContainer = {
   companyCrawlerService: Provider<CompanyCrawlerService>;
   robotsPolicyService: Provider<RobotsPolicyService>;
   pageExtractionService: Provider<PageExtractionService>;
+  publicSearchProvider: Provider<PublicSearchProvider | null>;
+  publicDiscussionResearchService: Provider<PublicDiscussionResearchService>;
 };
 
 export const createAppContainer = (config: AppConfig): AppContainer => {
@@ -161,10 +166,31 @@ export const createAppContainer = (config: AppConfig): AppContainer => {
     () =>
       new CompanyCrawlerService({
         retrievalClient: retrievalClient(),
+        urlSafety: urlSafetyService(),
         linkDiscovery: linkDiscoveryService(),
         linkRanking: linkRankingService(),
         robotsPolicy: robotsPolicyService(),
         pageExtraction: pageExtractionService(),
+        logger: logger(),
+      }),
+  );
+
+  // Null without BRAVE_SEARCH_API_KEY: discussion research degrades to a
+  // structured unavailable result instead of blocking boot or fabricating.
+  const publicSearchProvider = singleton<PublicSearchProvider | null>(() =>
+    config.braveSearchApiKey
+      ? new BraveSearchProvider({ apiKey: config.braveSearchApiKey, logger: logger() })
+      : null,
+  );
+
+  const publicDiscussionResearchService = singleton(
+    () =>
+      new PublicDiscussionResearchService({
+        searchProvider: publicSearchProvider(),
+        retrievalClient: retrievalClient(),
+        robotsPolicy: robotsPolicyService(),
+        pageExtraction: pageExtractionService(),
+        linkDiscovery: linkDiscoveryService(),
         logger: logger(),
       }),
   );
@@ -191,5 +217,7 @@ export const createAppContainer = (config: AppConfig): AppContainer => {
     companyCrawlerService,
     robotsPolicyService,
     pageExtractionService,
+    publicSearchProvider,
+    publicDiscussionResearchService,
   };
 };

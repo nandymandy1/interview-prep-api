@@ -332,6 +332,7 @@ describe('content + crawler integration', () => {
 
   const integrationCrawler = (): CompanyCrawlerService =>
     new CompanyCrawlerService({
+      urlSafety: new UrlSafetyService(),
       retrievalClient: new RetrievalClient({
         urlSafety: new UrlSafetyService({ dnsResolver: async () => [] }),
         logger: makeLogger(),
@@ -438,5 +439,21 @@ describe('content + crawler integration', () => {
     } finally {
       await stopServer();
     }
+  });
+});
+
+describe('extraction root fallback (A8)', () => {
+  const extractor = new PageExtractionService();
+
+  it('a main holding only chrome falls back to the article with real text', () => {
+    const content = extractor.extract({
+      body: `<html><head><title>Acme</title></head><body><main><nav><a href="/x">Menu link one</a><a href="/y">Menu link two</a></nav><script>var x = 1;</script><style>.a{color:red}</style></main><article><h1>Interview guide</h1><p>Real research text lives here.</p></article></body></html>`,
+      contentType: 'text/html',
+    });
+
+    expect(content.title).toBe('Acme');
+    expect(content.text).toContain('Real research text lives here.');
+    expect(content.text).not.toContain('Menu link one');
+    expect(content.headings).toContain('Interview guide');
   });
 });

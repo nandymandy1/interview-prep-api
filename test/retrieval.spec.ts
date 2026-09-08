@@ -16,7 +16,10 @@ import {
   type HttpGetter,
   type RetrievalHttpResponse,
 } from '@/modules/research/retrieval/retrieval-client.service';
-import { RetrievalException } from '@/modules/research/retrieval/retrieval.exception';
+import {
+  RedirectBlockedError,
+  RetrievalException,
+} from '@/modules/research/retrieval/retrieval.exception';
 import { toRetrievalFailure } from '@/modules/research/retrieval/retrieval.failure';
 import type { RetrievalFailureCode } from '@/modules/research/retrieval/retrieval.type';
 import {
@@ -1315,4 +1318,109 @@ describe('local HTTP integration (evaluation mode)', () => {
       await stopServer();
     }
   }, 15000);
+});
+
+describe('redirect guard (A1)', () => {
+  it('a guard rejection aborts the redirect before the target is fetched', async () => {
+    const seen: string[] = [];
+    const guardCalls: string[] = [];
+    const client = makeClient({
+      dns: productionDns(),
+      http: scriptHttp([redirectResponse('/private'), okResponse()], seen),
+    });
+
+    const outcome = await client
+      .retrieve({
+        url: 'http://public.example/go',
+        mode: 'production',
+        onBeforeRedirect: async (next) => {
+          guardCalls.push(next.toString());
+          throw new RedirectBlockedError('ROBOTS_DISALLOWED', next.toString());
+        },
+      })
+      .then(
+        () => null,
+        (error: unknown) => error,
+      );
+
+    expect(outcome).toBeInstanceOf(RedirectBlockedError);
+    expect((outcome as RedirectBlockedError).url).toBe('http://public.example/private');
+    expect(guardCalls).toEqual(['http://public.example/private']);
+    expect(seen).toEqual(['http://public.example/go']);
+  });
+
+  it('an allowing guard lets the redirect proceed normally', async () => {
+    const seen: string[] = [];
+    const guardCalls: string[] = [];
+    const client = makeClient({
+      dns: productionDns(),
+      http: scriptHttp([redirectResponse('/next'), okResponse({ body: 'arrived' })], seen),
+    });
+
+    const result = await client.retrieve({
+      url: 'http://public.example/go',
+      mode: 'production',
+      onBeforeRedirect: async (next) => {
+        guardCalls.push(next.toString());
+      },
+    });
+
+    expect(guardCalls).toEqual(['http://public.example/next']);
+    expect(seen).toEqual(['http://public.example/go', 'http://public.example/next']);
+    expect(result.ok).toBe(true);
+  });
+
+  it('shape validation runs before the guard is invoked', async () => {
+    const seen: string[] = [];
+    let guardCalls = 0;
+    const client = makeClient({
+      dns: productionDns(),
+      http: scriptHttp([redirectResponse('ftp://public.example/file')], seen),
+    });
+
+    const result = await client.retrieve({
+      url: 'http://public.example/go',
+      mode: 'production',
+      onBeforeRedirect: async () => {
+        guardCalls += 1;
+      },
+    });
+
+    expect(result.ok).toBe(false);
+
+    if (!result.ok) {
+      expect(result.failure.code).toBe('UNSUPPORTED_PROTOCOL');
+    }
+
+    expect(guardCalls).toBe(0);
+    expect(seen).toEqual(['http://public.example/go']);
+  });
+});
+
+describe('post-DNS deadline check (A2)', () => {
+  it('DNS consuming the deadline never starts an HTTP request', async () => {
+    const seen: string[] = [];
+    const calls: string[] = [];
+    let now = 1_000_000;
+    const slowDns: DnsResolver = async (hostname: string) => {
+      calls.push(hostname);
+      now += RETRIEVAL_TOTAL_TIMEOUT_MS + 1;
+      return [PUBLIC_IPV4];
+    };
+    const client = makeClient({
+      dns: slowDns,
+      http: scriptHttp([okResponse()], seen),
+      now: () => now,
+    });
+
+    const result = await client.retrieve({ url: 'http://public.example/', mode: 'production' });
+
+    expect(calls).toEqual(['public.example']);
+    expect(seen).toEqual([]);
+    expect(result.ok).toBe(false);
+
+    if (!result.ok) {
+      expect(result.failure.code).toBe('TIMEOUT');
+    }
+  });
 });

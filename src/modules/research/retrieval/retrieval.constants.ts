@@ -21,3 +21,8 @@ export const RETRIEVAL_RETRYABLE_STATUSES: ReadonlySet<number> = new Set([
 ]);
 
 export const RETRIEVAL_REDIRECT_STATUSES: ReadonlySet<number> = new Set([301, 302, 303, 307, 308]);
+
+// Anchor discovery applies to HTML documents only. text/plain bodies are
+// extracted as research content, never parsed as navigation.
+export const isHtmlContentType = (contentType: string): boolean =>
+  contentType === 'text/html' || contentType === 'application/xhtml+xml';

@@ -18,9 +18,13 @@ import {
   RETRIEVAL_TOTAL_TIMEOUT_MS,
   RETRIEVAL_USER_AGENT,
 } from '@/modules/research/retrieval/retrieval.constants';
-import { RetrievalException } from '@/modules/research/retrieval/retrieval.exception';
+import {
+  RedirectBlockedError,
+  RetrievalException,
+} from '@/modules/research/retrieval/retrieval.exception';
 import { toRetrievalResult } from '@/modules/research/retrieval/retrieval.failure';
 import type {
+  RedirectGuard,
   RetrievedResource,
   RetrievalMode,
   RetrievalRequest,
@@ -141,12 +145,18 @@ export class RetrievalClient {
   }
 
   // Boundary helper: expected source failures become data for the later
-  // crawler/orchestrator instead of killing the pipeline.
+  // crawler/orchestrator instead of killing the pipeline. A redirect-guard
+  // rejection (RedirectBlockedError) is the caller's own policy decision and
+  // propagates untouched so it can be mapped to caller-level skips.
   async retrieve(request: RetrievalRequest): Promise<RetrievalResult> {
     try {
       const resource = await this.fetchResource(request);
       return { ok: true, resource };
     } catch (error) {
+      if (error instanceof RedirectBlockedError) {
+        throw error;
+      }
+
       if (error instanceof RetrievalException) {
         return toRetrievalResult(error);
       }
@@ -185,8 +195,18 @@ export class RetrievalClient {
       this.throwIfExpired(remainingMs(), start.toString());
 
       try {
-        return await this.fetchOnce(start, request.mode, attempt, remainingMs);
+        return await this.fetchOnce(
+          start,
+          request.mode,
+          attempt,
+          remainingMs,
+          request.onBeforeRedirect,
+        );
       } catch (error) {
+        if (error instanceof RedirectBlockedError) {
+          throw error;
+        }
+
         const failure = this.normalizeTransportError(error, start.toString());
 
         this.logger.warn('retrieval.attempt_failed', {
@@ -243,12 +263,17 @@ export class RetrievalClient {
     mode: RetrievalMode,
     attempt: number,
     remainingMs: () => number,
+    onBeforeRedirect?: RedirectGuard,
   ): Promise<RetrievedResource> {
     let current = new URL(start.toString());
 
     for (let redirect = 0; ; redirect += 1) {
       this.throwIfExpired(remainingMs(), current.toString());
       await this.urlSafety.assertHostAllowed(current.hostname, mode, current.toString());
+
+      // DNS validation may itself consume the remaining budget; never start
+      // one more network request after the total deadline has expired.
+      this.throwIfExpired(remainingMs(), current.toString());
 
       const startedAt = this.now();
       const hopTimeoutMs = Math.max(1, Math.min(this.timeoutMs, remainingMs()));
@@ -304,8 +329,10 @@ export class RetrievalClient {
 
         // Reuse shape policy (protocol allow-list, credential rejection) then
         // re-run DNS/address policy at the top of the next loop iteration.
+        // The caller's redirect guard runs before any request to the target.
         this.urlSafety.normalizeUrl(next.toString());
         next.hash = '';
+        await onBeforeRedirect?.(next, current);
 
         this.logger.info('retrieval.redirect', {
           url: sanitizeUrlForLogging(current.toString()),

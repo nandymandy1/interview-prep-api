@@ -51,6 +51,7 @@ const okResponse = (overrides: Partial<RetrievalHttpResponse> = {}): RetrievalHt
 type StubRoute = {
   body?: string;
   finalUrl?: string;
+  contentType?: string;
   fail?: { code: RetrievalFailureCode; status?: number };
 };
 
@@ -89,7 +90,7 @@ const scriptRetrieval = (
         requestedUrl: request.url,
         finalUrl,
         status: 200,
-        contentType: 'text/html',
+        contentType: route.contentType ?? 'text/html',
         body,
         bytes: Buffer.byteLength(body, 'utf8'),
       },
@@ -116,6 +117,7 @@ const makeCrawler = (
   } = {},
 ): CompanyCrawlerService =>
   new CompanyCrawlerService({
+    urlSafety: new UrlSafetyService(),
     retrievalClient: retrieval,
     linkDiscovery: new LinkDiscoveryService(),
     linkRanking: new LinkRankingService(),
@@ -1145,6 +1147,7 @@ describe('local evaluator integration', () => {
     });
 
     return new CompanyCrawlerService({
+      urlSafety: new UrlSafetyService(),
       retrievalClient,
       linkDiscovery: new LinkDiscoveryService(),
       linkRanking: new LinkRankingService(),
@@ -1230,5 +1233,312 @@ describe('local evaluator integration', () => {
     } finally {
       await stopServer();
     }
+  });
+});
+
+describe('phase A carry-forward fixes', () => {
+  const scriptHttp = (steps: Array<RetrievalHttpResponse | Error>, seen: string[]): HttpGetter => {
+    const remaining = [...steps];
+    return async (url: string) => {
+      seen.push(url);
+      const step = remaining.shift();
+
+      if (!step) {
+        throw new Error('http script exhausted');
+      }
+
+      if (step instanceof Error) {
+        throw step;
+      }
+
+      return step;
+    };
+  };
+
+  const redirectTo = (location: string): RetrievalHttpResponse => ({
+    status: 302,
+    headers: { location },
+    body: '',
+  });
+
+  const htmlOk = (body: string): RetrievalHttpResponse => ({
+    status: 200,
+    headers: { 'content-type': 'text/html; charset=utf-8' },
+    body,
+  });
+
+  // Real client + real robots policy over a scripted transport so redirect
+  // guards run exactly as in production. 127.0.0.1 literals keep evaluation
+  // mode free of DNS while staying origin-scoped.
+  const guardCrawler = (
+    steps: Array<RetrievalHttpResponse | Error>,
+    seen: string[],
+    sleeps: number[] = [],
+  ): CompanyCrawlerService => {
+    const http = scriptHttp(steps, seen);
+    const client = new RetrievalClient({
+      urlSafety: new UrlSafetyService(),
+      logger: makeLogger(),
+      httpGet: http,
+      sleep: async () => {},
+      random: () => 0,
+    });
+
+    return new CompanyCrawlerService({
+      urlSafety: new UrlSafetyService(),
+      retrievalClient: client,
+      linkDiscovery: new LinkDiscoveryService(),
+      linkRanking: new LinkRankingService(),
+      robotsPolicy: new RobotsPolicyService({ retrievalClient: client, logger: makeLogger() }),
+      pageExtraction: new PageExtractionService(),
+      logger: makeLogger(),
+      sleep: async (ms: number) => {
+        sleeps.push(ms);
+      },
+    });
+  };
+
+  it('A1. seed redirect to a robots-disallowed target is never fetched', async () => {
+    const seen: string[] = [];
+    const crawler = guardCrawler(
+      [htmlOk('User-agent: *\nDisallow: /private\n'), redirectTo('/private')],
+      seen,
+    );
+
+    const result = await crawler.crawlCompanySite({
+      companyUrl: 'http://127.0.0.1:18080/go',
+      mode: 'evaluation',
+    });
+
+    expect(seen).toEqual(['http://127.0.0.1:18080/robots.txt', 'http://127.0.0.1:18080/go']);
+    expect(result.pages).toEqual([]);
+    expect(result.failures).toEqual([]);
+    expect(result.skipped).toEqual([
+      {
+        url: 'http://127.0.0.1:18080/private',
+        reason: 'ROBOTS_DISALLOWED',
+        discoveredFrom: null,
+        depth: 0,
+      },
+    ]);
+  });
+
+  it('A1. candidate redirect outside company scope is never fetched', async () => {
+    const seen: string[] = [];
+    const crawler = guardCrawler(
+      [
+        htmlOk('User-agent: *\nDisallow:\n'),
+        htmlOk(link('/go', 'Go')),
+        redirectTo('http://127.0.0.2:19090/away'),
+      ],
+      seen,
+    );
+
+    const result = await crawler.crawlCompanySite({
+      companyUrl: 'http://127.0.0.1:18081/',
+      mode: 'evaluation',
+    });
+
+    expect(seen).not.toContain('http://127.0.0.2:19090/away');
+    expect(seen).not.toContain('http://127.0.0.2:19090/robots.txt');
+    expect(result.skipped).toContainEqual({
+      url: 'http://127.0.0.2:19090/away',
+      reason: 'OUT_OF_SCOPE_REDIRECT',
+      discoveredFrom: 'http://127.0.0.1:18081/',
+      depth: 1,
+    });
+    expect(result.pages.map((page) => page.finalUrl)).toContain('http://127.0.0.1:18081/');
+  });
+
+  it('A3. robots fetch participates in per-origin pacing before the seed', async () => {
+    const seen: string[] = [];
+    const sleeps: number[] = [];
+    const now = 5_000_000;
+    const retrieval = scriptRetrieval(
+      {
+        'https://paced.example/robots.txt': { body: 'User-agent: *\nDisallow:\n' },
+        'https://paced.example/': { body: '' },
+      },
+      seen,
+    );
+    const crawler = new CompanyCrawlerService({
+      urlSafety: new UrlSafetyService(),
+      retrievalClient: retrieval,
+      linkDiscovery: new LinkDiscoveryService(),
+      linkRanking: new LinkRankingService(),
+      robotsPolicy: new RobotsPolicyService({ retrievalClient: retrieval, logger: makeLogger() }),
+      pageExtraction: new PageExtractionService(),
+      logger: makeLogger(),
+      sleep: async (ms: number) => {
+        sleeps.push(ms);
+      },
+      now: () => now,
+    });
+
+    const result = await crawler.crawlCompanySite({
+      companyUrl: 'https://paced.example/',
+      mode: 'production',
+    });
+
+    expect(seen).toEqual(['https://paced.example/robots.txt', 'https://paced.example/']);
+    expect(result.pages).toHaveLength(1);
+    // The robots request starts the origin clock, so the seed cannot follow
+    // immediately: exactly one base-interval wait separates them.
+    expect(sleeps).toEqual([200]);
+  });
+
+  it('A4. text/plain bodies extract content without feeding link discovery', async () => {
+    const seen: string[] = [];
+    const crawler = makeCrawler(
+      scriptRetrieval(
+        {
+          'https://plain.example/': {
+            body: '<a href="/careers">Careers</a>\nplain research notes',
+            contentType: 'text/plain',
+          },
+        },
+        seen,
+      ),
+    );
+
+    const result = await crawler.crawlCompanySite({
+      companyUrl: 'https://plain.example/',
+      mode: 'production',
+    });
+
+    expect(seen).toEqual(['https://plain.example/']);
+    expect(result.pages).toHaveLength(1);
+    expect(result.pages[0]?.content.text).toContain('plain research notes');
+    expect(result.rankedLinks).toEqual([]);
+  });
+
+  it('A5. a trimmed candidate rediscovered with a stronger signal is fetched once', async () => {
+    const seen: string[] = [];
+    const seedLinks = Array.from({ length: 200 }, (_, index) =>
+      link(`/f${String(index + 1).padStart(3, '0')}`, 'page'),
+    ).join('');
+    const fillerLinks = (tag: string, anchor: string): string =>
+      `${link('/foo', anchor)}${Array.from({ length: 200 }, (_, index) =>
+        link(`/u${tag}${String(index).padStart(3, '0')}`, 'page'),
+      ).join('')}`;
+
+    const generativeRetrieval = (
+      routes: Record<string, StubRoute>,
+      seenUrls: string[],
+    ): Pick<RetrievalClient, 'retrieve'> => ({
+      retrieve: async (request: RetrievalRequest): Promise<RetrievalResult> => {
+        seenUrls.push(request.url);
+        const route = routes[request.url];
+
+        if (!route) {
+          return toRetrievalResult(
+            new RetrievalException('HTTP_ERROR', 'stub has no route', {
+              url: request.url,
+              status: 404,
+            }),
+          );
+        }
+
+        const body = route.body ?? '';
+        const finalUrl = route.finalUrl ?? request.url;
+
+        return {
+          ok: true,
+          resource: {
+            requestedUrl: request.url,
+            finalUrl,
+            status: 200,
+            contentType: 'text/html',
+            body,
+            bytes: Buffer.byteLength(body, 'utf8'),
+          },
+        };
+      },
+    });
+
+    const crawler = makeCrawler(
+      generativeRetrieval(
+        {
+          'https://trim.example/': { body: seedLinks },
+          'https://trim.example/f001': { body: fillerLinks('a', 'details') },
+          'https://trim.example/f002': { body: fillerLinks('b', 'details') },
+          'https://trim.example/f003': { body: fillerLinks('c', 'Careers') },
+          'https://trim.example/f004': { body: fillerLinks('d', 'Careers') },
+          'https://trim.example/foo': { body: 'foo careers page' },
+        },
+        seen,
+      ),
+    );
+
+    const result = await crawler.crawlCompanySite({
+      companyUrl: 'https://trim.example/',
+      mode: 'production',
+    });
+
+    const fooFetches = seen.filter((url) => url === 'https://trim.example/foo');
+    expect(fooFetches).toHaveLength(1);
+    const fooPage = result.pages.find((page) => page.finalUrl === 'https://trim.example/foo');
+    expect(fooPage?.relevanceScore).toBe(100);
+    expect(
+      result.rankedLinks.find((entry) => entry.url === 'https://trim.example/foo')?.signals,
+    ).toContain('anchor:careers');
+    expect(result.truncationReasons).toContain('candidate-limit');
+  });
+
+  it('A6. malformed and unsupported seeds return structured failures without throwing', async () => {
+    for (const companyUrl of ['javascript:alert(1)', 'ftp://acme.example/', 'not a url', '']) {
+      const seen: string[] = [];
+      const crawler = makeCrawler(scriptRetrieval({}, seen));
+
+      const result = await crawler.crawlCompanySite({ companyUrl, mode: 'production' });
+
+      expect(result.pages).toEqual([]);
+      expect(result.finalSeedUrl).toBeNull();
+      expect(result.failures).toHaveLength(1);
+      // Only the seed retrieval itself is attempted: robots preflight never
+      // throws on the malformed seed and fetches nothing.
+      expect(seen).toEqual([companyUrl]);
+    }
+  });
+
+  it('A7. deadline lost during pacing does not inflate attempted requests', async () => {
+    const seen: string[] = [];
+    let now = 9_000_000;
+    let sleeps = 0;
+    const crawler = new CompanyCrawlerService({
+      urlSafety: new UrlSafetyService(),
+      retrievalClient: scriptRetrieval(
+        {
+          'https://paced.example/': { body: `${link('/a', 'A')}${link('/b', 'B')}` },
+          'https://paced.example/a': { body: '' },
+          'https://paced.example/b': { body: '' },
+        },
+        seen,
+      ),
+      linkDiscovery: new LinkDiscoveryService(),
+      linkRanking: new LinkRankingService(),
+      robotsPolicy: allowAllRobots(),
+      pageExtraction: new PageExtractionService(),
+      logger: makeLogger(),
+      sleep: async () => {
+        sleeps += 1;
+        // The seed pace makes no sleep call (first request for the origin);
+        // the first candidate pace exhausts the deadline.
+        if (sleeps >= 1) {
+          now += 60_000;
+        }
+      },
+      now: () => now,
+    });
+
+    const result = await crawler.crawlCompanySite({
+      companyUrl: 'https://paced.example/',
+      mode: 'production',
+    });
+
+    expect(result.pages).toHaveLength(1);
+    expect(seen).toEqual(['https://paced.example/']);
+    expect(result.stats.pageRequestsAttempted).toBe(1);
+    expect(result.truncationReasons).toContain('deadline');
   });
 });

@@ -19,6 +19,7 @@ import {
   ROBOTS_USER_AGENT_TOKEN,
 } from '@/modules/research/robots/robots.constants';
 import { RobotsPolicyService } from '@/modules/research/robots/robots-policy.service';
+import { UrlSafetyService } from '@/modules/research/retrieval/url-safety.service';
 
 const makeLogger = (): LoggerService =>
   new LoggerService({
@@ -29,6 +30,7 @@ const makeLogger = (): LoggerService =>
 type StubRoute = {
   body?: string;
   finalUrl?: string;
+  contentType?: string;
   fail?: { code: RetrievalFailureCode; status?: number };
 };
 
@@ -67,7 +69,7 @@ const scriptRetrieval = (
         requestedUrl: request.url,
         finalUrl,
         status: 200,
-        contentType: 'text/plain',
+        contentType: route.contentType ?? 'text/html',
         body,
         bytes: Buffer.byteLength(body, 'utf8'),
       },
@@ -83,6 +85,7 @@ const makeRobotsCrawler = (
   const retrieval = scriptRetrieval(routes, seen);
 
   return new CompanyCrawlerService({
+    urlSafety: new UrlSafetyService(),
     retrievalClient: retrieval,
     linkDiscovery: new LinkDiscoveryService(),
     linkRanking: new LinkRankingService(),
@@ -142,7 +145,9 @@ describe('robots policy', () => {
     });
 
     expect(result.pages).toHaveLength(2);
-    expect(result.robots).toEqual([{ origin: 'https://acme.example', status: 'missing' }]);
+    expect(result.robots).toEqual([
+      { origin: 'https://acme.example', status: 'missing', httpStatus: 404 },
+    ]);
   });
 
   it('4/8. Disallow /private prevents the fetch and records a skip, not a failure', async () => {
@@ -272,7 +277,14 @@ describe('robots policy', () => {
         depth: 0,
       },
     ]);
-    expect(result.robots).toEqual([{ origin: 'https://acme.example', status: 'unavailable' }]);
+    expect(result.robots).toEqual([
+      {
+        origin: 'https://acme.example',
+        status: 'unavailable',
+        httpStatus: 429,
+        failureCode: 'RATE_LIMITED',
+      },
+    ]);
   });
 
   it('10. robots 5xx and network failures stay unavailable, never allow-all', async () => {
@@ -296,6 +308,14 @@ describe('robots policy', () => {
       expect(result.pages).toEqual([]);
       expect(result.skipped[0]?.reason).toBe('ROBOTS_UNAVAILABLE');
       expect(seen).toEqual(['https://acme.example/robots.txt']);
+      expect(result.robots).toEqual([
+        {
+          origin: 'https://acme.example',
+          status: 'unavailable',
+          ...(fail.status !== undefined ? { httpStatus: fail.status } : {}),
+          failureCode: fail.code,
+        },
+      ]);
     }
   });
 

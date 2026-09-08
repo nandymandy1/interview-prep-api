@@ -30,16 +30,24 @@ import type {
   RobotsPolicy,
   RobotsPolicyCache,
 } from '@/modules/research/robots/robots.type';
+import { RedirectBlockedError } from '@/modules/research/retrieval/retrieval.exception';
+import { isHtmlContentType } from '@/modules/research/retrieval/retrieval.constants';
 import type {
   RetrievalClient,
   Sleep,
   Clock,
 } from '@/modules/research/retrieval/retrieval-client.service';
-import type { RetrievedResource } from '@/modules/research/retrieval/retrieval.type';
+import type {
+  RedirectGuard,
+  RetrievedResource,
+  RetrievalResult,
+} from '@/modules/research/retrieval/retrieval.type';
 import { sanitizeUrlForLogging } from '@/modules/research/retrieval/url-safety.service';
+import type { UrlSafetyService } from '@/modules/research/retrieval/url-safety.service';
 
 type CompanyCrawlerDependencies = {
   retrievalClient: Pick<RetrievalClient, 'retrieve'>;
+  urlSafety: Pick<UrlSafetyService, 'normalizeUrl'>;
   linkDiscovery: LinkDiscoveryService;
   linkRanking: LinkRankingService;
   robotsPolicy: Pick<RobotsPolicyService, 'loadPolicy' | 'isUrlAllowed'>;
@@ -99,6 +107,7 @@ const compareScoredLinks = (
 
 export class CompanyCrawlerService {
   private readonly retrievalClient: Pick<RetrievalClient, 'retrieve'>;
+  private readonly urlSafety: Pick<UrlSafetyService, 'normalizeUrl'>;
   private readonly linkDiscovery: LinkDiscoveryService;
   private readonly linkRanking: LinkRankingService;
   private readonly robotsPolicy: Pick<RobotsPolicyService, 'loadPolicy' | 'isUrlAllowed'>;
@@ -109,6 +118,7 @@ export class CompanyCrawlerService {
 
   constructor(dependencies: CompanyCrawlerDependencies) {
     this.retrievalClient = dependencies.retrievalClient;
+    this.urlSafety = dependencies.urlSafety;
     this.linkDiscovery = dependencies.linkDiscovery;
     this.linkRanking = dependencies.linkRanking;
     this.robotsPolicy = dependencies.robotsPolicy;
@@ -135,10 +145,12 @@ export class CompanyCrawlerService {
 
     // Robots policy for the seed origin loads before any content request.
     // A disallowed or conservatively unavailable seed is never fetched.
+    // Shape validation runs before origin construction so malformed or
+    // unsupported seeds skip preflight and surface as structured failures.
     let seedOrigin: string | null = null;
 
     try {
-      seedOrigin = new URL(input.companyUrl).origin;
+      seedOrigin = this.urlSafety.normalizeUrl(input.companyUrl).origin;
     } catch {
       seedOrigin = null;
     }
@@ -149,6 +161,8 @@ export class CompanyCrawlerService {
         input.mode,
         robotsCache,
         pendingRobotsLoads,
+        pacing,
+        deadlineAt,
       );
 
       if (seedPolicy && !this.checkAllowed(seedPolicy, input.companyUrl)) {
@@ -187,10 +201,51 @@ export class CompanyCrawlerService {
     }
 
     let pageRequestsAttempted = 0;
-    const seedResult = await this.retrievalClient.retrieve({
-      url: input.companyUrl,
-      mode: input.mode,
-    });
+    let seedResult: RetrievalResult;
+
+    try {
+      seedResult = await this.retrievalClient.retrieve({
+        url: input.companyUrl,
+        mode: input.mode,
+        onBeforeRedirect: seedOrigin
+          ? this.seedRedirectGuard(input.mode, robotsCache, pendingRobotsLoads, pacing, deadlineAt)
+          : undefined,
+      });
+    } catch (error) {
+      // The seed redirect guard rejected a target before it was fetched.
+      if (error instanceof RedirectBlockedError) {
+        this.logger.warn('crawl.seed_redirect_blocked', {
+          url: sanitizeUrlForLogging(error.url),
+          reason: error.reason,
+        });
+
+        return {
+          seedUrl: input.companyUrl,
+          finalSeedUrl: null,
+          pages: [],
+          failures: [],
+          skipped: [
+            {
+              url: error.url,
+              reason:
+                error.reason === 'ROBOTS_DISALLOWED'
+                  ? 'ROBOTS_DISALLOWED'
+                  : 'OUT_OF_SCOPE_REDIRECT',
+              discoveredFrom: null,
+              depth: 0,
+            },
+          ],
+          rankedLinks: [],
+          truncated: false,
+          truncationReasons: [],
+          robots: this.robotsStatuses(robotsCache),
+          stats: this.buildStats(1, 0, 0, 1),
+        };
+      }
+
+      throw error;
+    }
+
     pageRequestsAttempted += 1;
 
     if (!seedResult.ok) {
@@ -230,6 +285,11 @@ export class CompanyCrawlerService {
     const skipped: CrawlSkip[] = [];
     const bestByUrl = new Map<string, CrawlCandidate>();
     const enqueuedUrls = new Set<string>([seed.requestedUrl]);
+    // Permanently requested: normalized URLs that actually reached the
+    // retrieval client (plus the seed's own URLs). Trimmed queue entries leave
+    // enqueuedUrls so a stronger later signal can requeue them, but nothing
+    // here is ever fetched twice.
+    const requestedUrls = new Set<string>([seed.requestedUrl, seed.finalUrl]);
     const visitedFinal = new Set<string>();
     const truncationReasons = new Set<CrawlTruncationReason>();
     let depthExcluded = false;
@@ -244,7 +304,14 @@ export class CompanyCrawlerService {
     pages.push(seedPage);
     visitedFinal.add(seed.finalUrl);
 
-    const seedExpansion = this.expandCandidates(seed, 0, scope, enqueuedUrls, bestByUrl);
+    const seedExpansion = this.expandCandidates(
+      seed,
+      0,
+      scope,
+      enqueuedUrls,
+      requestedUrls,
+      bestByUrl,
+    );
     depthExcluded = seedExpansion.droppedDepth;
     candidateLimitHit = seedExpansion.hitCandidateLimit;
     let queue = seedExpansion.candidates;
@@ -273,6 +340,8 @@ export class CompanyCrawlerService {
             robotsCache,
             pendingRobotsLoads,
             originDelays,
+            pacing,
+            deadlineAt,
           ),
         ),
       );
@@ -295,7 +364,6 @@ export class CompanyCrawlerService {
       }
 
       queue.unshift(...overflow);
-      pageRequestsAttempted += batch.length;
 
       const fetched = await Promise.all(
         batch.map((candidate) =>
@@ -312,13 +380,23 @@ export class CompanyCrawlerService {
         ),
       );
 
+      // Attempts count only retrieval calls actually initiated: candidates
+      // that lost the deadline during pacing return null and consume nothing.
+      pageRequestsAttempted += fetched.filter((outcome) => outcome !== null).length;
+
       if (fetched.some((outcome) => outcome === null) && this.now() >= deadlineAt) {
         truncationReasons.add('deadline');
       }
 
-      for (const outcome of fetched) {
+      for (const [index, outcome] of fetched.entries()) {
         if (!outcome) {
           continue;
+        }
+
+        const attempted = batch[index];
+
+        if (attempted) {
+          requestedUrls.add(attempted.url);
         }
 
         if (outcome.skip) {
@@ -354,6 +432,7 @@ export class CompanyCrawlerService {
 
         pages.push(outcome.page);
         visitedFinal.add(outcome.page.finalUrl);
+        requestedUrls.add(outcome.page.finalUrl);
 
         // Every fetched page is expanded for discovery truth (including
         // max-depth pages, whose deeper links are recorded but not queued).
@@ -362,6 +441,7 @@ export class CompanyCrawlerService {
           outcome.page.depth,
           scope,
           enqueuedUrls,
+          requestedUrls,
           bestByUrl,
         );
         queue.push(...expansion.candidates);
@@ -369,7 +449,7 @@ export class CompanyCrawlerService {
         candidateLimitHit = candidateLimitHit || expansion.hitCandidateLimit;
       }
 
-      const capped = this.capQueue(queue);
+      const capped = this.capQueue(queue, enqueuedUrls);
       queue = capped.queue;
       candidateLimitHit = candidateLimitHit || capped.trimmed;
     }
@@ -456,18 +536,22 @@ export class CompanyCrawlerService {
 
   // Discovers links from a fetched page, keeps the best deterministic signal
   // per normalized URL, scores, and ranks before capping so a later DOM
-  // Careers link is never discarded for an early low-value link.
+  // Careers link is never discarded for an early low-value link. Only HTML
+  // documents feed anchor discovery; text/plain bodies extract content only.
   private expandCandidates(
-    resource: Pick<RetrievedResource, 'requestedUrl' | 'finalUrl' | 'body'>,
+    resource: Pick<RetrievedResource, 'requestedUrl' | 'finalUrl' | 'body' | 'contentType'>,
     depth: number,
     scope: CrawlScope,
     enqueuedUrls: Set<string>,
+    requestedUrls: Set<string>,
     bestByUrl: Map<string, CrawlCandidate>,
   ): { candidates: CrawlCandidate[]; droppedDepth: boolean; hitCandidateLimit: boolean } {
     let droppedDepth = false;
     let hitCandidateLimit = false;
 
-    const discovered = this.linkDiscovery.discoverLinks(resource.body, resource.finalUrl);
+    const discovered = isHtmlContentType(resource.contentType)
+      ? this.linkDiscovery.discoverLinks(resource.body, resource.finalUrl)
+      : [];
     const byUrl = new Map<string, { anchorText: string; score: number; signals: string[] }>();
 
     for (const link of discovered) {
@@ -526,6 +610,20 @@ export class CompanyCrawlerService {
           global.signals = entry.signals;
         }
 
+        if (candidateDepth > MAX_CRAWL_DEPTH) {
+          droppedDepth = true;
+          continue;
+        }
+
+        // Queue trimming releases URLs from the queued set (not from the
+        // requested set): a trimmed URL rediscovered with a stronger signal
+        // becomes eligible again, but never fetches twice.
+        if (requestedUrls.has(entry.url) || enqueuedUrls.has(entry.url)) {
+          continue;
+        }
+
+        enqueuedUrls.add(entry.url);
+        candidates.push(global);
         continue;
       }
 
@@ -544,7 +642,7 @@ export class CompanyCrawlerService {
         continue;
       }
 
-      if (enqueuedUrls.has(entry.url)) {
+      if (requestedUrls.has(entry.url) || enqueuedUrls.has(entry.url)) {
         continue;
       }
 
@@ -556,13 +654,24 @@ export class CompanyCrawlerService {
   }
 
   // Keeps the highest-value candidates when the queue exceeds its bound.
-  private capQueue(queue: CrawlCandidate[]): { queue: CrawlCandidate[]; trimmed: boolean } {
+  // Trimmed entries leave the queued set so a stronger later signal can
+  // requeue them; the requested set is untouched.
+  private capQueue(
+    queue: CrawlCandidate[],
+    enqueuedUrls: Set<string>,
+  ): { queue: CrawlCandidate[]; trimmed: boolean } {
     if (queue.length <= MAX_CRAWL_CANDIDATES) {
       return { queue, trimmed: false };
     }
 
     queue.sort(compareCrawlCandidates);
-    return { queue: queue.slice(0, MAX_CRAWL_CANDIDATES), trimmed: true };
+    const kept = queue.slice(0, MAX_CRAWL_CANDIDATES);
+
+    for (const removed of queue.slice(MAX_CRAWL_CANDIDATES)) {
+      enqueuedUrls.delete(removed.url);
+    }
+
+    return { queue: kept, trimmed: true };
   }
 
   private async fetchCandidate(
@@ -591,7 +700,43 @@ export class CompanyCrawlerService {
       return null;
     }
 
-    const result = await this.retrievalClient.retrieve({ url: candidate.url, mode });
+    let result: RetrievalResult;
+
+    try {
+      result = await this.retrievalClient.retrieve({
+        url: candidate.url,
+        mode,
+        onBeforeRedirect: this.candidateRedirectGuard(
+          scope,
+          mode,
+          robotsCache,
+          pendingRobotsLoads,
+          pacing,
+          deadlineAt,
+        ),
+      });
+    } catch (error) {
+      // The redirect guard rejected a target before it was fetched: record a
+      // truthful crawler-level skip instead of a retrieval failure.
+      if (error instanceof RedirectBlockedError) {
+        this.logger.warn('crawl.redirect_blocked', {
+          url: sanitizeUrlForLogging(error.url),
+          reason: error.reason,
+        });
+
+        return {
+          skip: {
+            url: error.url,
+            reason:
+              error.reason === 'ROBOTS_DISALLOWED' ? 'ROBOTS_DISALLOWED' : 'OUT_OF_SCOPE_REDIRECT',
+            discoveredFrom: candidate.discoveredFrom,
+            depth: candidate.depth,
+          },
+        };
+      }
+
+      throw error;
+    }
 
     if (!result.ok) {
       const failure = result.failure;
@@ -622,6 +767,8 @@ export class CompanyCrawlerService {
       mode,
       robotsCache,
       pendingRobotsLoads,
+      pacing,
+      deadlineAt,
     );
 
     if (finalPolicy && !this.checkAllowed(finalPolicy, result.resource.finalUrl)) {
@@ -663,10 +810,19 @@ export class CompanyCrawlerService {
     robotsCache: RobotsPolicyCache,
     pendingRobotsLoads: Map<string, Promise<RobotsPolicy>>,
     originDelays: Map<string, number>,
+    pacing: CrawlPacing,
+    deadlineAt: number,
   ): Promise<{ candidate: CrawlCandidate; skip?: CrawlSkip }> {
     void scope;
     const origin = new URL(candidate.url).origin;
-    const policy = await this.policyForOrigin(origin, mode, robotsCache, pendingRobotsLoads);
+    const policy = await this.policyForOrigin(
+      origin,
+      mode,
+      robotsCache,
+      pendingRobotsLoads,
+      pacing,
+      deadlineAt,
+    );
 
     if (!policy) {
       this.logger.warn('crawl.page_skipped', {
@@ -706,12 +862,16 @@ export class CompanyCrawlerService {
 
   // One cached policy per origin per crawl, with in-flight dedupe so a
   // concurrent batch never fetches one origin's robots.txt twice. Returns
-  // null when the origin budget is exhausted.
+  // null when the origin budget is exhausted. The robots fetch itself is
+  // paced through the shared per-origin gate so it participates in the same
+  // timing discipline as content requests.
   private async policyForOrigin(
     origin: string,
     mode: CrawlInput['mode'],
     robotsCache: RobotsPolicyCache,
     pendingRobotsLoads: Map<string, Promise<RobotsPolicy>>,
+    pacing: CrawlPacing,
+    deadlineAt: number,
   ): Promise<RobotsPolicy | null> {
     const cached = robotsCache.get(origin);
 
@@ -729,7 +889,9 @@ export class CompanyCrawlerService {
       return null;
     }
 
-    const loading = this.robotsPolicy.loadPolicy(origin, mode, robotsCache);
+    const loading = this.robotsPolicy.loadPolicy(origin, mode, robotsCache, async (target) => {
+      await this.paceOrigin(target, pacing, deadlineAt, CRAWL_MIN_REQUEST_INTERVAL_MS);
+    });
     pendingRobotsLoads.set(origin, loading);
 
     try {
@@ -748,6 +910,62 @@ export class CompanyCrawlerService {
     }
   }
 
+  // Seed redirect guard: the crawl scope derives from the final seed URL, so
+  // seed redirects are checked for robots policy only. A disallowed target is
+  // never fetched; the rejection propagates as RedirectBlockedError.
+  private seedRedirectGuard(
+    mode: CrawlInput['mode'],
+    robotsCache: RobotsPolicyCache,
+    pendingRobotsLoads: Map<string, Promise<RobotsPolicy>>,
+    pacing: CrawlPacing,
+    deadlineAt: number,
+  ): RedirectGuard {
+    return async (next) => {
+      const policy = await this.policyForOrigin(
+        next.origin,
+        mode,
+        robotsCache,
+        pendingRobotsLoads,
+        pacing,
+        deadlineAt,
+      );
+
+      if (policy && !this.checkAllowed(policy, next.toString())) {
+        throw new RedirectBlockedError('ROBOTS_DISALLOWED', next.toString());
+      }
+    };
+  }
+
+  // Candidate redirect guard: the target must stay in crawl scope and pass
+  // the target origin's robots policy before any request to it is performed.
+  private candidateRedirectGuard(
+    scope: CrawlScope,
+    mode: CrawlInput['mode'],
+    robotsCache: RobotsPolicyCache,
+    pendingRobotsLoads: Map<string, Promise<RobotsPolicy>>,
+    pacing: CrawlPacing,
+    deadlineAt: number,
+  ): RedirectGuard {
+    return async (next) => {
+      if (!this.isInScope(next, scope)) {
+        throw new RedirectBlockedError('OUT_OF_SCOPE', next.toString());
+      }
+
+      const policy = await this.policyForOrigin(
+        next.origin,
+        mode,
+        robotsCache,
+        pendingRobotsLoads,
+        pacing,
+        deadlineAt,
+      );
+
+      if (policy && !this.checkAllowed(policy, next.toString())) {
+        throw new RedirectBlockedError('ROBOTS_DISALLOWED', next.toString());
+      }
+    };
+  }
+
   private skipForPolicy(
     policy: RobotsPolicy,
     url: string,
@@ -764,7 +982,12 @@ export class CompanyCrawlerService {
 
   private robotsStatuses(robotsCache: RobotsPolicyCache): RobotsOriginStatus[] {
     return [...robotsCache.values()]
-      .map((policy) => ({ origin: policy.origin, status: policy.state }))
+      .map((policy) => ({
+        origin: policy.origin,
+        status: policy.state,
+        ...(policy.status !== undefined ? { httpStatus: policy.status } : {}),
+        ...(policy.failureCode !== undefined ? { failureCode: policy.failureCode } : {}),
+      }))
       .sort((left, right) =>
         left.origin < right.origin ? -1 : left.origin > right.origin ? 1 : 0,
       );

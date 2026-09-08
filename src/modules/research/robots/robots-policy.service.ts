@@ -34,12 +34,18 @@ export class RobotsPolicyService {
     origin: string,
     mode: RetrievalMode,
     cache: RobotsPolicyCache,
+    beforeFetch?: (origin: string) => Promise<void>,
   ): Promise<RobotsPolicy> {
     const cached = cache.get(origin);
 
     if (cached) {
       return cached;
     }
+
+    // The caller owns request pacing: this hook runs only when robots.txt is
+    // actually fetched (never on cache hits) so robots requests participate
+    // in the caller's per-origin timing discipline.
+    await beforeFetch?.(origin);
 
     const policy = await this.fetchPolicy(origin, mode);
     cache.set(origin, policy);

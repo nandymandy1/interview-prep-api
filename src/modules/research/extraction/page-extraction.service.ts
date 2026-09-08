@@ -8,14 +8,20 @@ import {
   MAX_TITLE_CHARS,
 } from '@/modules/research/extraction/extraction.constants';
 import type { ExtractedPageContent } from '@/modules/research/extraction/extraction.type';
+import { isHtmlContentType } from '@/modules/research/retrieval/retrieval.constants';
 
 const BLOCK_SELECTOR = 'p, li, h1, h2, h3, h4, h5, h6, blockquote, pre, dt, dd';
+
+// Chrome stripped before usefulness is judged: a <main> holding only
+// navigation/scripts must not shadow an <article> with real text.
+const CHROME_SELECTOR =
+  'script, style, noscript, template, svg, canvas, iframe, form, nav, footer, aside, [hidden], [aria-hidden="true"]';
 
 // Static retrieved HTML only: no JavaScript execution, no browser, no SPA
 // rendering. Converts one bounded page into research-ready text.
 export class PageExtractionService {
   extract(input: { body: string; contentType: string }): ExtractedPageContent {
-    if (input.contentType !== 'text/html' && input.contentType !== 'application/xhtml+xml') {
+    if (!isHtmlContentType(input.contentType)) {
       return this.fromPlainText(input.body);
     }
 
@@ -33,11 +39,7 @@ export class PageExtractionService {
     );
 
     const root = this.contentRoot($);
-    root
-      .find(
-        'script, style, noscript, template, svg, canvas, iframe, form, nav, footer, aside, [hidden], [aria-hidden="true"]',
-      )
-      .remove();
+    root.find(CHROME_SELECTOR).remove();
 
     const headings: string[] = [];
 
@@ -112,17 +114,26 @@ export class PageExtractionService {
 
   private contentRoot($: ReturnType<typeof load>) {
     // header is deliberately kept: page H1/title content may live there.
+    // Usefulness is judged after chrome removal, so a main holding only
+    // navigation/scripts falls back to the next candidate with real text.
     const candidates = ['main', 'article', '[role="main"]', 'body'];
 
     for (const selector of candidates) {
       const root = $(selector).first();
 
-      if (root.length > 0) {
-        const text = this.normalize(root.text());
+      if (root.length === 0) {
+        continue;
+      }
 
-        if (text || selector === 'body') {
-          return root;
-        }
+      if (selector === 'body') {
+        return root;
+      }
+
+      const cleaned = root.clone();
+      cleaned.find(CHROME_SELECTOR).remove();
+
+      if (this.normalize(cleaned.text())) {
+        return root;
       }
     }
 
