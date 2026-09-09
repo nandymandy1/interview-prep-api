@@ -87,7 +87,8 @@ const categoryLabel: Record<KitQuestion['category'], string> = {
 };
 
 // Deterministic day focus from scheduled material: up to two dominant question
-// categories (ties broken alphabetically). Days without questions stay open review.
+// categories (ties broken alphabetically). Days without questions stay honest
+// review placeholders.
 const dayFocus = (
   questionIds: readonly string[],
   questionsById: ReadonlyMap<string, KitQuestion>,
@@ -101,7 +102,7 @@ const dayFocus = (
     .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
     .slice(0, 2)
     .map(([category]) => categoryLabel[category]);
-  return top.length > 0 ? top.join(' + ') : 'Open review';
+  return top.length > 0 ? top.join(' + ') : 'Review available role and company context';
 };
 
 export const allocateSchedule = ({
@@ -135,7 +136,7 @@ export const allocateSchedule = ({
 
   const days = Array.from({ length: daysAvailable }, (_, index): KitScheduleDay => ({
     day: index + 1,
-    focus: 'Open review',
+    focus: 'Review available role and company context',
     question_ids: [],
     minutes: 0,
   }));

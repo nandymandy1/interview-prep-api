@@ -1,17 +1,14 @@
 import session, { type SessionOptions } from 'express-session';
-import { RedisStore } from 'connect-redis';
-import type { RedisClientType } from 'redis';
+import type { Redis } from 'ioredis';
+import { IORedisSessionStore } from '@/infrastructure/session/ioredis-session.store';
 import type { AppConfig } from '@/config/app.config';
 
 export const createSessionMiddleware = (
-  redisClient: RedisClientType,
+  redisClient: Redis,
   config: AppConfig,
 ): ReturnType<typeof session> => {
   const options: SessionOptions = {
-    store: new RedisStore({
-      client: redisClient,
-      prefix: 'session:',
-    }),
+    store: new IORedisSessionStore(redisClient),
     resave: false,
     saveUninitialized: false,
     secret: config.sessionSecret,

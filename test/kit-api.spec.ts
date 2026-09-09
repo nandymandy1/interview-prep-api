@@ -95,7 +95,7 @@ const buildApp = (repository: KitRepository & MockRepository, userId?: string) =
   const kitService = new KitService({
     kitRepository: repository,
     generationQueue: { add: queueAdd } as never,
-    kitGeneration: {} as never,
+    kitGeneration: (() => ({})) as never,
     research: {} as never,
     logger,
   });
@@ -241,6 +241,28 @@ describe('kit owner scoping', () => {
     });
   });
 
+  it('creates kits without resolving the LLM-backed generation service', async () => {
+    const repository = ownedRepository();
+    const throwingGeneration = (): never => {
+      throw new Error('No LLM provider is configured.');
+    };
+    const service = new KitService({
+      kitRepository: repository,
+      generationQueue: { add: vi.fn(async () => ({})) } as never,
+      kitGeneration: throwingGeneration as never,
+      research: {} as never,
+      logger: silentLogger(),
+    });
+
+    const result = await service.createKit(USER_A, {
+      jd: 'Build things',
+      companyUrl: 'https://acme.test/jobs',
+      days: 5,
+    });
+
+    expect(result).toEqual({ kitId: KIT_A, status: 'queued' });
+  });
+
   it('lets owners read their own kit', async () => {
     const response = await request(buildApp(ownedRepository(), USER_A)).get(`/api/kits/${KIT_A}`);
 
@@ -313,7 +335,7 @@ describe('kit list pagination validation', () => {
     const service = new KitService({
       kitRepository: ownedRepository(),
       generationQueue: {} as never,
-      kitGeneration: {} as never,
+      kitGeneration: (() => ({})) as never,
       research: {} as never,
       logger: silentLogger(),
     });

@@ -1,6 +1,6 @@
 import { createServer } from 'node:http';
 import type { Worker } from 'bullmq';
-import type { RedisClientType } from 'redis';
+import type { Redis } from 'ioredis';
 import { createApp } from '@/app';
 import { loadAppConfig } from '@/config/app.config';
 import { createAppContainer } from '@/container/app-container';
@@ -21,16 +21,12 @@ const bootstrap = async (): Promise<void> => {
   await container.redis().connect();
 
   // Same deployment: the BullMQ worker (sandboxed thread) and the progress
-  // subscriber start with the API. No second service required.
-  let worker: Worker<GenerationJobData> | null = null;
-  let subscriber: RedisClientType | null = null;
-
-  try {
-    worker = startGenerationWorker(config.redisUrl, logger);
-    subscriber = await startProgressSubscriber(container.redis().getClient(), logger);
-  } catch (error) {
-    logger.error(error, 'server.worker_bootstrap_failed');
-  }
+  // subscriber start with the API. No second service required. A worker that
+  // cannot start aborts boot: an API that listens but can never process a
+  // generation job would strand kits in queued forever.
+  const worker: Worker<GenerationJobData> = startGenerationWorker(config.redisUrl, logger);
+  await worker.waitUntilReady();
+  const subscriber: Redis = await startProgressSubscriber(container.redis().getClient(), logger);
 
   const app = createApp(config, container);
   const server = createServer(app);
@@ -55,8 +51,12 @@ const bootstrap = async (): Promise<void> => {
     server.close(async (serverError) => {
       try {
         await Promise.allSettled([
-          worker?.close(),
-          subscriber?.quit(),
+          worker.close(),
+          container
+            .generationQueue()
+            .close()
+            .then(() => container.generationQueue().disconnect()),
+          subscriber.quit(),
           container.mongoDatabase().disconnect(),
           container.redis().disconnect(),
         ]);

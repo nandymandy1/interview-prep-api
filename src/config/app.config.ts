@@ -2,6 +2,8 @@ import 'dotenv/config';
 
 export type NodeEnvironment = 'development' | 'test' | 'production';
 
+export type LlmProviderName = 'openai' | 'gemini';
+
 export type AppConfig = {
   nodeEnv: NodeEnvironment;
   port: number;
@@ -12,6 +14,9 @@ export type AppConfig = {
   sessionCookieName: string;
   logLevel: string;
   braveSearchApiKey?: string;
+  llmProvider?: LlmProviderName;
+  openaiApiKey?: string;
+  openaiModel?: string;
   geminiApiKey?: string;
   geminiModel?: string;
 };
@@ -68,5 +73,22 @@ export const loadAppConfig = (): AppConfig => {
     // and every deterministic pipeline stay unaffected.
     geminiApiKey: process.env.GEMINI_API_KEY?.trim() || undefined,
     geminiModel: process.env.GEMINI_MODEL?.trim() || undefined,
+    llmProvider: parseLlmProvider(process.env.LLM_PROVIDER),
+    openaiApiKey: process.env.OPENAI_API_KEY?.trim() || undefined,
+    openaiModel: process.env.OPENAI_MODEL?.trim() || undefined,
   };
+};
+
+const parseLlmProvider = (value: string | undefined): LlmProviderName | undefined => {
+  const normalized = value?.trim().toLowerCase();
+
+  if (!normalized) {
+    return undefined;
+  }
+
+  if (normalized === 'openai' || normalized === 'gemini') {
+    return normalized;
+  }
+
+  throw new Error('LLM_PROVIDER must be openai or gemini when set.');
 };

@@ -75,14 +75,12 @@ export const validateInterviewKit = (value: unknown): InterviewKit => {
 // Domain boundary: KitValidationException carries no HTTP semantics. A future HTTP input
 // boundary may translate it into 400 when the client payload itself is invalid; generation
 // orchestration must translate it into retry/repair handling instead.
+//
+// Thin-JD kits are valid final kits: zero requirements, zero questions, and zero
+// flashcards are honest when the JD supports nothing more. Coverage truth
+// (no uncovered IDs), exact-day scheduling, and reference integrity still hold.
 export const validateFinalInterviewKit = (value: unknown): InterviewKit => {
   const kit = validateInterviewKit(value);
-  if (kit.role.requirements.length < 1) {
-    throw new KitValidationException('Final interview kit must contain at least one requirement.');
-  }
-  if (kit.questions.length < 1) {
-    throw new KitValidationException('Final interview kit must contain at least one question.');
-  }
   if (kit.coverage.passes < 1 || kit.coverage.uncovered_requirement_ids.length > 0) {
     throw new KitValidationException(
       'Final interview kit must have completed coverage with no uncovered requirements.',

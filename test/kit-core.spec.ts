@@ -426,12 +426,15 @@ describe('schedule allocation', () => {
     expect(schedule).toEqual(allocateSchedule({ requirements, questions, daysAvailable: 2 }));
   });
 
-  it('keeps open review for days without scheduled questions', () => {
+  it('keeps an honest review focus for days without scheduled questions', () => {
     const schedule = allocateSchedule({ requirements, questions, daysAvailable: 5 });
     expect(schedule.days).toHaveLength(5);
     expect(
       schedule.days.filter((day) => day.question_ids.length === 0).map((day) => day.focus),
-    ).toEqual(['Open review', 'Open review']);
+    ).toEqual([
+      'Review available role and company context',
+      'Review available role and company context',
+    ]);
     expect(schedule.days.every((day) => day.focus.trim().length > 0)).toBe(true);
   });
 });
@@ -448,38 +451,48 @@ describe('InterviewKit validation', () => {
     expect(validateFinalInterviewKit(createKit())).toEqual(createKit());
   });
 
-  it('rejects a vacuous final kit with zero requirements', () => {
+  it('accepts an honest thin final kit with zero requirements', () => {
     const kit = createKit();
     kit.role.requirements = [];
     kit.questions = [];
     kit.flashcards = [];
     kit.schedule = {
       days_available: 1,
-      days: [{ day: 1, focus: 'Practice', question_ids: [], minutes: 0 }],
+      days: [
+        {
+          day: 1,
+          focus: 'Review available role and company context',
+          question_ids: [],
+          minutes: 0,
+        },
+      ],
     };
     kit.coverage = { uncovered_requirement_ids: [], passes: 1 };
 
     expect(validateInterviewKit(kit)).toEqual(kit);
-    expect(() => validateFinalInterviewKit(kit)).toThrow(
-      'Final interview kit must contain at least one requirement.',
-    );
+    expect(validateFinalInterviewKit(kit)).toEqual(kit);
   });
 
-  it('rejects a vacuous final kit with zero questions', () => {
+  it('accepts a thin final kit with requirements but zero questions', () => {
     const kit = createKit();
     kit.role.requirements = [{ id: 'r1', text: 'TypeScript', kind: 'technical', priority: 'nice' }];
     kit.questions = [];
     kit.flashcards = [];
     kit.schedule = {
       days_available: 1,
-      days: [{ day: 1, focus: 'Practice', question_ids: [], minutes: 0 }],
+      days: [
+        {
+          day: 1,
+          focus: 'Review available role and company context',
+          question_ids: [],
+          minutes: 0,
+        },
+      ],
     };
     kit.coverage = { uncovered_requirement_ids: [], passes: 1 };
 
     expect(validateInterviewKit(kit)).toEqual(kit);
-    expect(() => validateFinalInterviewKit(kit)).toThrow(
-      'Final interview kit must contain at least one question.',
-    );
+    expect(validateFinalInterviewKit(kit)).toEqual(kit);
   });
 
   it('rejects incomplete must-have coverage for final kits while base validation passes', () => {

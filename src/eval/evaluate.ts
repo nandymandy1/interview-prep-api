@@ -13,22 +13,22 @@ import { UrlSafetyService } from '@/modules/research/retrieval/url-safety.servic
 import { RobotsPolicyService } from '@/modules/research/robots/robots-policy.service';
 import { InProcessBraveGate } from '@/modules/research/search/brave-gate';
 import { BraveSearchProvider } from '@/modules/research/search/brave-search.provider';
-import { GeminiService } from '@/modules/generation/gemini.service';
+import { resolveLlmAdapter } from '@/modules/generation/llm/resolve-llm-adapter';
 import { KitGenerationService } from '@/modules/generation/kit-generation.service';
 import type { InterviewKit } from '@/modules/kit/kit.type';
 
 export type EvaluationCase = {
   id?: string;
   jd: string;
-  companyUrl: string;
+  company_url: string;
   days?: number;
 };
 
 export type EvaluationKitEntry = {
-  caseId: string;
+  id: string;
   status: 'ok' | 'failed';
-  kit?: InterviewKit;
-  error?: { code: string; message: string };
+  kit: InterviewKit | null;
+  error: { code: string; message: string } | null;
 };
 
 export type EvaluationReport = {
@@ -55,7 +55,7 @@ export const runEvaluation = async (
     try {
       const { kit } = await generate.generate({
         jd: evaluationCase.jd,
-        companyUrl: evaluationCase.companyUrl,
+        companyUrl: evaluationCase.company_url,
         days: evaluationCase.days ?? 5,
         mode: 'evaluation',
         onProgress: async (stage, message) => {
@@ -63,11 +63,12 @@ export const runEvaluation = async (
         },
       });
 
-      kits.push({ caseId, status: 'ok', kit });
+      kits.push({ id: caseId, status: 'ok', kit, error: null });
     } catch (error) {
       kits.push({
-        caseId,
+        id: caseId,
         status: 'failed',
+        kit: null,
         error: {
           code: 'EVALUATION_CASE_FAILED',
           message: error instanceof Error ? error.message : 'Case failed.',
@@ -106,14 +107,14 @@ const parseCases = (raw: unknown): EvaluationCase[] => {
       throw new Error(`Case ${index + 1}: jd is required.`);
     }
 
-    if (typeof candidate.companyUrl !== 'string' || !candidate.companyUrl.trim()) {
-      throw new Error(`Case ${index + 1}: companyUrl is required.`);
+    if (typeof candidate.company_url !== 'string' || !candidate.company_url.trim()) {
+      throw new Error(`Case ${index + 1}: company_url is required.`);
     }
 
     return {
       ...(typeof candidate.id === 'string' ? { id: candidate.id } : {}),
       jd: candidate.jd,
-      companyUrl: candidate.companyUrl,
+      company_url: candidate.company_url,
       ...(candidate.days !== undefined ? { days: candidate.days } : {}),
     };
   });
@@ -166,13 +167,18 @@ const createEvaluatorGeneration = (config: AppConfig): KitGenerationService => {
     discussionResearch,
     logger,
   });
-  const gemini = new GeminiService({
-    apiKey: config.geminiApiKey,
-    model: config.geminiModel,
-    logger,
-  });
+  const llm = resolveLlmAdapter(
+    {
+      llmProvider: config.llmProvider,
+      openaiApiKey: config.openaiApiKey,
+      openaiModel: config.openaiModel,
+      geminiApiKey: config.geminiApiKey,
+      geminiModel: config.geminiModel,
+    },
+    { logger },
+  );
 
-  return new KitGenerationService({ research, gemini, logger });
+  return new KitGenerationService({ research, llm, logger });
 };
 
 const main = async (): Promise<void> => {
@@ -192,6 +198,14 @@ const main = async (): Promise<void> => {
     ...(process.env.BRAVE_SEARCH_API_KEY?.trim()
       ? { braveSearchApiKey: process.env.BRAVE_SEARCH_API_KEY.trim() }
       : {}),
+    ...(process.env.LLM_PROVIDER?.trim().toLowerCase() === 'openai' ||
+    process.env.LLM_PROVIDER?.trim().toLowerCase() === 'gemini'
+      ? { llmProvider: process.env.LLM_PROVIDER.trim().toLowerCase() as 'openai' | 'gemini' }
+      : {}),
+    ...(process.env.OPENAI_API_KEY?.trim()
+      ? { openaiApiKey: process.env.OPENAI_API_KEY.trim() }
+      : {}),
+    ...(process.env.OPENAI_MODEL?.trim() ? { openaiModel: process.env.OPENAI_MODEL.trim() } : {}),
     ...(process.env.GEMINI_API_KEY?.trim()
       ? { geminiApiKey: process.env.GEMINI_API_KEY.trim() }
       : {}),

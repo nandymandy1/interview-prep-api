@@ -1,8 +1,9 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { Queue, Worker } from 'bullmq';
-import type { RedisClientType } from 'redis';
+import type { Redis } from 'ioredis';
 import type { LoggerService } from '@/infrastructure/logger/logger.service';
+import { createRedisConnection } from '@/infrastructure/redis/redis.service';
 import type { GenerationJobData, GenerationStage } from '@/modules/generation/generation.type';
 
 export const KIT_GENERATION_QUEUE = 'kit-generation';
@@ -20,22 +21,6 @@ export type GenerationProgressEvent = {
 };
 
 type QueueLogger = Pick<LoggerService, 'info' | 'warn' | 'error'>;
-
-// REDIS_URL (redis://...) is the only supported form; BullMQ needs
-// host/port options, so parse once here instead of adding a new package.
-const bullmqConnection = (redisUrl: string): { host: string; port: number; password?: string } => {
-  const parsed = new URL(redisUrl);
-
-  if (parsed.protocol !== 'redis:') {
-    throw new Error('REDIS_URL must use the redis:// scheme for the generation queue.');
-  }
-
-  return {
-    host: parsed.hostname,
-    port: parsed.port ? Number(parsed.port) : 6379,
-    ...(parsed.password ? { password: decodeURIComponent(parsed.password) } : {}),
-  };
-};
 
 // __dirname is src/modules/generation in dev and dist/modules/generation
 // after build; up three levels is the package root either way.
@@ -56,9 +41,12 @@ export const generationProcessorFile = (): string => {
   return file;
 };
 
+// Every connection originates from REDIS_URL via one tiny helper — no host,
+// port, or credential splitting. BullMQ connections require
+// maxRetriesPerRequest: null.
 export const createGenerationQueue = (redisUrl: string): Queue<GenerationJobData> =>
   new Queue<GenerationJobData>(KIT_GENERATION_QUEUE, {
-    connection: bullmqConnection(redisUrl),
+    connection: createRedisConnection(redisUrl, { maxRetriesPerRequest: null }),
   });
 
 // jobId = kitId: the same kit can never be enqueued twice. attempts = 1
@@ -81,7 +69,7 @@ export const startGenerationWorker = (
   logger: QueueLogger,
 ): Worker<GenerationJobData> => {
   const worker = new Worker<GenerationJobData>(KIT_GENERATION_QUEUE, generationProcessorFile(), {
-    connection: bullmqConnection(redisUrl),
+    connection: createRedisConnection(redisUrl, { maxRetriesPerRequest: null }),
     concurrency: GENERATION_WORKER_CONCURRENCY,
     useWorkerThreads: true,
   });
@@ -94,7 +82,7 @@ export const startGenerationWorker = (
 };
 
 export const publishProgress = async (
-  client: RedisClientType,
+  client: Redis,
   event: Omit<GenerationProgressEvent, 'timestamp'>,
 ): Promise<void> => {
   const payload: GenerationProgressEvent = { ...event, timestamp: new Date().toISOString() };
@@ -102,14 +90,16 @@ export const publishProgress = async (
 };
 
 // Best-effort notification only: Mongo kit status stays the source of truth,
-// so a lost message never corrupts GET /status. The subscriber just logs.
+// so a lost message never corrupts GET /status. The subscriber uses a
+// dedicated duplicated connection that never serves ordinary commands.
 export const startProgressSubscriber = async (
-  client: RedisClientType,
+  client: Redis,
   logger: QueueLogger,
-): Promise<RedisClientType> => {
+): Promise<Redis> => {
   const subscriber = client.duplicate();
   await subscriber.connect();
-  await subscriber.subscribe(KIT_GENERATION_PROGRESS_CHANNEL, (message) => {
+  await subscriber.subscribe(KIT_GENERATION_PROGRESS_CHANNEL);
+  subscriber.on('message', (_channel, message) => {
     try {
       const event = JSON.parse(message) as GenerationProgressEvent;
       logger.info('generation.progress', {

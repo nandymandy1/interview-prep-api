@@ -5,7 +5,7 @@ import { calculateCoverage } from '@/modules/coverage/coverage.service';
 import type { CompanyResearchService } from '@/modules/research/company-research.service';
 import { companyNameHintFromCrawl } from '@/modules/research/company-research.service';
 import type { CompanyResearchResult } from '@/modules/research/company-research.service';
-import type { GeminiService } from '@/modules/generation/gemini.service';
+import type { LlmGenerationAdapter } from '@/modules/generation/llm/llm-adapter';
 import { buildResearchContext, type ResearchContext } from '@/modules/generation/research-context';
 import type {
   GenerationInput,
@@ -40,7 +40,7 @@ export type GeneratedKit = {
 
 type KitGenerationDependencies = {
   research: Pick<CompanyResearchService, 'researchCompany'>;
-  gemini: Pick<GeminiService, 'generateJson'>;
+  llm: LlmGenerationAdapter;
   logger: LoggerService;
 };
 
@@ -59,7 +59,8 @@ const extractionSchema = z.object({
   seniority: z.string().trim().min(1).catch('Not specified'),
   location: z.string().trim().min(1).nullish(),
   responsibilities: z.array(z.string().trim().min(1)).default([]),
-  requirements: z.array(requirementDraftSchema).min(1),
+  // Thin JDs honestly yield zero requirements; never pad or invent.
+  requirements: z.array(requirementDraftSchema).default([]),
 });
 
 const briefSchema = z.object({
@@ -75,18 +76,18 @@ const flashcardDraftSchema = z.object({
 
 const briefFlashcardsSchema = z.object({
   brief: briefSchema,
-  flashcards: z.array(flashcardDraftSchema).min(1),
+  flashcards: z.array(flashcardDraftSchema).default([]),
 });
 
 const questionDraftSchema = z.object({
   prompt: z.string().trim().min(1),
   answer_outline: z.string().trim().min(1),
   difficulty: z.union([z.literal(1), z.literal(2), z.literal(3)]),
-  requirement_ids: z.array(z.string()).min(1),
+  requirement_ids: z.array(z.string()).default([]),
 });
 
 const categoryQuestionsSchema = z.object({
-  questions: z.array(questionDraftSchema).min(1),
+  questions: z.array(questionDraftSchema).default([]),
 });
 
 const repairSchema = z.object({
@@ -122,17 +123,19 @@ export class KitGenerationService {
   constructor(private readonly dependencies: KitGenerationDependencies) {}
 
   async generate(input: GenerationInput): Promise<GeneratedKit> {
-    const { gemini, logger } = this.dependencies;
+    const { logger } = this.dependencies;
     const sequences = createInitialSequences();
     const progress = this.progressOf(input.onProgress);
 
     await progress('researching', 'Extracting role requirements from the job description.');
-    const extraction = await gemini.generateJson(
-      `${DATA_GUARD}\n\nExtract the hiring signal from this job description (JD only; no external knowledge). ` +
+    const extraction = await this.json(
+      'You extract hiring signals from job descriptions. Return only JSON matching the requested shape.',
+      `Extract the hiring signal from this job description (JD only; no external knowledge). ` +
         `Split duties into "responsibilities". Split hiring criteria into "requirements" with kind ` +
         `(technical = hard skills, behavioural = soft skills, domain = industry knowledge) and priority ` +
         `("must" = explicitly required, "nice" = bonus/preferred/nice-to-have). A thin JD yields thin ` +
-        `requirements; never pad.\n\nReturn JSON: {"title": string, "seniority": string, "location": string|null, ` +
+        `requirements — possibly zero. Never invent technologies, years of experience, or criteria ` +
+        `absent from the text.\n\nReturn JSON: {"title": string, "seniority": string, "location": string|null, ` +
         `"responsibilities": string[], "requirements": [{"text": string, "kind": "technical|behavioural|domain", ` +
         `"priority": "must|nice"}]}\n\nJOB DESCRIPTION:\n${input.jd}`,
       extractionSchema,
@@ -261,6 +264,17 @@ export class KitGenerationService {
     return validateInterviewKit(value);
   }
 
+  private async json<T>(
+    systemPrompt: string,
+    userPrompt: string,
+    schema: z.ZodType<T>,
+  ): Promise<T> {
+    return this.dependencies.llm.generateJson(
+      { systemPrompt: `${DATA_GUARD}\n\n${systemPrompt}`, userPrompt },
+      schema,
+    );
+  }
+
   private async briefAndFlashcards(
     roleTitle: string,
     requirements: readonly KitRequirement[],
@@ -268,11 +282,12 @@ export class KitGenerationService {
     briefOnly = false,
   ): Promise<{ brief: { summary: string; what_they_do: string }; flashcards: FlashcardDraft[] }> {
     const validIds = new Set(requirements.map((requirement) => requirement.id));
-    const pack = await this.dependencies.gemini.generateJson(
-      `${DATA_GUARD}\n\nFor a "${roleTitle}" candidate, write a short company brief from the evidence ` +
+    const pack = await this.json(
+      `You write company briefs and study flashcards for candidates. Return only JSON matching the requested shape.`,
+      `For a "${roleTitle}" candidate, write a short company brief from the evidence ` +
         `(${briefOnly ? 'brief only' : 'brief plus study flashcards linked to requirement IDs'}). ` +
         `If the evidence is missing, say so honestly instead of fabricating.\n\n` +
-        `Valid requirement IDs: ${[...validIds].join(', ') || '(none)'}\n\n` +
+        `Valid requirement IDs: ${[...validIds].join(', ') || '(none — leave requirement_ids empty)'}\n\n` +
         `Return JSON: {"brief": {"summary": string, "what_they_do": string}, ` +
         `"flashcards": [{"front": string, "back": string, "requirement_ids": string[]}]}\n\n` +
         `EVIDENCE:\n${context.text}`,
@@ -312,11 +327,14 @@ export class KitGenerationService {
       .slice(0, 10)
       .map((question) => `- ${question.prompt}`);
 
-    const parsed = await this.dependencies.gemini.generateJson(
-      `${DATA_GUARD}\n\nWrite ${category} interview questions for a "${roleTitle}" candidate. ` +
+    const parsed = await this.json(
+      `You write interview questions for candidates. Return only JSON matching the requested shape.`,
+      `Write ${category} interview questions for a "${roleTitle}" candidate. ` +
         `Every question MUST reference at least one valid requirement ID below and must not duplicate ` +
-        `existing prompts. Calibrate difficulty 1 (junior) to 3 (staff+).\n\n` +
-        `Requirements:\n${pool.map((requirement) => `${requirement.id} [${requirement.priority}]: ${requirement.text}`).join('\n')}\n\n` +
+        `existing prompts. When there are no valid requirement IDs, write general ${category} questions ` +
+        `with empty requirement_ids instead of inventing requirements. ` +
+        `Calibrate difficulty 1 (junior) to 3 (staff+).\n\n` +
+        `Requirements:\n${pool.map((requirement) => `${requirement.id} [${requirement.priority}]: ${requirement.text}`).join('\n') || '(none)'}\n\n` +
         `${existingPrompts.length > 0 ? `Already asked (do not repeat):\n${existingPrompts.join('\n')}\n\n` : ''}` +
         `Return JSON: {"questions": [{"prompt": string, "answer_outline": string, "difficulty": 1|2|3, ` +
         `"requirement_ids": string[]}]}\n\nEVIDENCE (may be empty):\n${context.text}`,
@@ -352,8 +370,9 @@ export class KitGenerationService {
 
     // Exactly one targeted repair pass: only uncovered requirements, small
     // existing-question context, then coverage runs again in generate().
-    const parsed = await this.dependencies.gemini.generateJson(
-      `${DATA_GUARD}\n\nThese MUST-have requirements have no interview question yet. ` +
+    const parsed = await this.json(
+      `You write interview questions that cover specific hiring requirements. Return only JSON matching the requested shape.`,
+      `These MUST-have requirements have no interview question yet. ` +
         `Write the smallest set of questions that covers each one exactly. ` +
         `Every question needs a category and at least one requirement ID from the list.\n\n` +
         `Uncovered:\n${targets.map((requirement) => `${requirement.id} [${requirement.kind}]: ${requirement.text}`).join('\n')}\n\n` +
@@ -376,7 +395,8 @@ export class KitGenerationService {
   private keepValidRefs(ids: readonly string[], validIds: ReadonlySet<string>): string[] {
     const kept = [...new Set(ids)].filter((id) => validIds.has(id));
 
-    if (kept.length === 0) {
+    // Thin kits have no requirements at all: empty references are honest.
+    if (kept.length === 0 && validIds.size > 0) {
       throw new KitValidationException('Generated content referenced no valid requirement.');
     }
 

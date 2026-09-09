@@ -27,7 +27,6 @@
     "bullmq": "^6.3.4",
     "cheerio": "^1.2.0",
     "compression": "^1.8.1",
-    "connect-redis": "^9.0.0",
     "cors": "^2.8.5",
     "dotenv": "^17.2.2",
     "express": "^5.1.0",
@@ -38,7 +37,6 @@
     "mongoose": "^8.18.0",
     "mongoose-paginate-v2": "^1.9.5",
     "pino": "^9.9.0",
-    "redis": "^5.8.2",
     "robots-parser": "^3.0.1",
     "tldts": "^7.4.12",
     "zod": "^4.5.4"

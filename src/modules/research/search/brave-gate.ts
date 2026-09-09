@@ -1,4 +1,4 @@
-import type { RedisClientType } from 'redis';
+import type { Redis } from 'ioredis';
 import { BRAVE_MIN_REQUEST_INTERVAL_MS } from '@/modules/research/search/search.constants';
 
 // One-method seam: every Brave HTTP attempt (initials and retries) passes
@@ -41,7 +41,7 @@ export class InProcessBraveGate implements BraveRequestGate {
 }
 
 type RedisBraveGateDependencies = {
-  client: RedisClientType;
+  client: Redis;
   key: string;
   intervalMs?: number;
   sleep?: Sleep;
@@ -65,16 +65,13 @@ export class RedisBraveGate implements BraveRequestGate {
     const { client } = this.dependencies;
 
     for (;;) {
-      const acquired = await client.set(this.key, randomToken(), {
-        PX: this.intervalMs,
-        NX: true,
-      });
+      const acquired = await client.set(this.key, randomToken(), 'PX', this.intervalMs, 'NX');
 
-      if (acquired !== null) {
+      if (acquired === 'OK') {
         return;
       }
 
-      const ttl = await client.pTTL(this.key);
+      const ttl = await client.pttl(this.key);
       await this.sleep(ttl > 0 ? ttl : this.intervalMs);
     }
   }

@@ -142,7 +142,8 @@ const repairFixture = {
 // extraction → brief/flashcards → four separate categories → optional repair.
 const scriptGemini = (coverBoth: boolean) => {
   const calls: string[] = [];
-  const generateJson = vi.fn(async (prompt: string) => {
+  const generateJson = vi.fn(async (request: { systemPrompt: string; userPrompt: string }) => {
+    const prompt = `${request.systemPrompt}\n\n${request.userPrompt}`;
     if (prompt.includes('Extract the hiring signal')) {
       calls.push('extraction');
       return extractionFixture;
@@ -177,7 +178,7 @@ const buildGeneration = (coverBoth: boolean) => {
   const script = scriptGemini(coverBoth);
   const generation = new KitGenerationService({
     research: { researchCompany: vi.fn(async () => fakeResearchResult()) },
-    gemini: { generateJson: script.generateJson as never },
+    llm: { provider: 'gemini', generateJson: script.generateJson } as never,
     logger: silentLogger(),
   });
 
@@ -242,24 +243,73 @@ describe('kit generation pipeline', () => {
     expect(second.kit.schedule.days_available).toBe(60);
     expect(second.kit.schedule.days).toHaveLength(60);
   });
+
+  it('produces an honest thin kit without inventing requirements', async () => {
+    const generateJson = vi.fn(async (request: { systemPrompt: string; userPrompt: string }) => {
+      const prompt = `${request.systemPrompt}\n\n${request.userPrompt}`;
+
+      if (prompt.includes('Extract the hiring signal')) {
+        return { ...extractionFixture, requirements: [] };
+      }
+
+      if (prompt.includes('company brief from the evidence')) {
+        return {
+          brief: briefFixture.brief,
+          flashcards: [],
+        };
+      }
+
+      return { questions: [] };
+    });
+    const generation = new KitGenerationService({
+      research: { researchCompany: vi.fn(async () => fakeResearchResult()) },
+      llm: { provider: 'openai', generateJson } as never,
+      logger: silentLogger(),
+    });
+
+    const { kit } = await generation.generate({
+      jd: 'Backend Engineer. Join our team.',
+      companyUrl: 'https://acme.test',
+      days: 3,
+      mode: 'evaluation' as const,
+    });
+
+    expect(() => validateFinalInterviewKit(kit)).not.toThrow();
+    expect(kit.role.requirements).toEqual([]);
+    expect(kit.coverage).toEqual({ uncovered_requirement_ids: [], passes: 1 });
+    expect(kit.schedule.days_available).toBe(3);
+    expect(kit.schedule.days).toHaveLength(3);
+    expect(
+      kit.schedule.days.every(
+        (day) =>
+          day.question_ids.length === 0 &&
+          day.minutes === 0 &&
+          day.focus === 'Review available role and company context',
+      ),
+    ).toBe(true);
+  });
 });
 
 describe('evaluator', () => {
-  it('writes the exact Appendix B envelope', async () => {
+  it('writes the exact Appendix B envelope (id, kit, error:null)', async () => {
     const kit = { id: 'kit' } as unknown as InterviewKit;
     const generate = { generate: vi.fn(async () => ({ kit, sequences: {} as never })) };
 
     const report = await runEvaluation(
-      [{ id: 'c1', jd: 'Build things.', companyUrl: 'https://acme.test', days: 2 }],
+      [{ id: 'case-01', jd: 'Build things.', company_url: 'https://acme.test', days: 2 }],
       generate,
     );
 
     expect(report.version).toBe('1.0');
     expect(typeof report.generated_at).toBe('string');
-    expect(report.kits).toEqual([{ caseId: 'c1', status: 'ok', kit }]);
+    expect(report.kits).toEqual([{ id: 'case-01', status: 'ok', kit, error: null }]);
+    // The external contract uses company_url (mapped internally to companyUrl).
+    expect(generate.generate).toHaveBeenCalledWith(
+      expect.objectContaining({ companyUrl: 'https://acme.test' }),
+    );
   });
 
-  it('continues after a failed case', async () => {
+  it('continues after a failed case with kit:null and an error object', async () => {
     const kit = { id: 'kit' } as unknown as InterviewKit;
     const generate = {
       generate: vi
@@ -270,15 +320,19 @@ describe('evaluator', () => {
 
     const report = await runEvaluation(
       [
-        { id: 'bad', jd: 'x', companyUrl: 'https://acme.test' },
-        { id: 'good', jd: 'y', companyUrl: 'https://acme.test' },
+        { id: 'case-01', jd: 'x', company_url: 'https://acme.test' },
+        { id: 'case-02', jd: 'y', company_url: 'https://acme.test' },
       ],
       generate,
     );
 
-    expect(report.kits[0]?.status).toBe('failed');
-    expect(report.kits[0]?.error?.code).toBe('EVALUATION_CASE_FAILED');
-    expect(report.kits[1]).toMatchObject({ caseId: 'good', status: 'ok' });
+    expect(report.kits[0]).toMatchObject({
+      id: 'case-01',
+      status: 'failed',
+      kit: null,
+      error: { code: 'EVALUATION_CASE_FAILED', message: 'boom' },
+    });
+    expect(report.kits[1]).toMatchObject({ id: 'case-02', status: 'ok', error: null });
   });
 });
 
@@ -503,7 +557,7 @@ describe('builder preservation', () => {
         updateGenerationState: vi.fn(),
       } as never,
       generationQueue: {} as never,
-      kitGeneration: {
+      kitGeneration: () => ({
         generateBrief:
           overrides.generateBrief ??
           vi.fn(async () => ({ summary: 'Fresh summary', what_they_do: 'Fresh what' })),
@@ -518,7 +572,7 @@ describe('builder preservation', () => {
             },
           ]),
         validateEditedKit: validateInterviewKit,
-      },
+      }),
       research: { researchCompany: vi.fn(async () => fakeResearchResult()) },
       logger: silentLogger(),
     });
@@ -568,7 +622,7 @@ describe('practice guard', () => {
         findOwnedById: vi.fn(async () => completedDoc({ status: 'queued', kit: null })),
       } as never,
       generationQueue: {} as never,
-      kitGeneration: {} as never,
+      kitGeneration: (() => ({})) as never,
       research: {} as never,
       logger: silentLogger(),
     });

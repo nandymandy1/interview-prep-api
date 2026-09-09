@@ -14,7 +14,7 @@ export type GenerationJobRunnerDependencies = {
   kitRepository: Pick<KitRepository, 'updateGenerationState' | 'saveGeneratedKit'>;
   generation: Pick<KitGenerationService, 'generate'>;
   publish: (event: Omit<GenerationProgressEvent, 'timestamp'>) => Promise<void>;
-  logger: Pick<LoggerService, 'info' | 'error'>;
+  logger: Pick<LoggerService, 'info' | 'warn' | 'error'>;
 };
 
 // The runnable core, exported for tests: persist each stage to Mongo (source
@@ -34,7 +34,14 @@ export const runGenerationJob = async (
       stage,
       stageMessage: message,
     });
-    await publish({ kitId, stage, message });
+
+    // Best-effort: a Pub/Sub failure must never fail an otherwise successful
+    // generation. Mongo above stays the source of truth.
+    try {
+      await publish({ kitId, stage, message });
+    } catch {
+      logger.warn('generation.progress_publish_failed', { kitId, stage });
+    }
   };
 
   try {
@@ -48,7 +55,13 @@ export const runGenerationJob = async (
     });
 
     await kitRepository.saveGeneratedKit(userId, kitId, kit, sequences);
-    await publish({ kitId, stage: 'completed', message: 'Kit completed.' });
+
+    try {
+      await publish({ kitId, stage: 'completed', message: 'Kit completed.' });
+    } catch {
+      logger.warn('generation.progress_publish_failed', { kitId, stage: 'completed' });
+    }
+
     logger.info('generation.job_completed', { kitId });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Generation failed.';
@@ -57,7 +70,13 @@ export const runGenerationJob = async (
       stageMessage: message,
       error: { code: 'GENERATION_FAILED', message },
     });
-    await publish({ kitId, stage: 'failed', message });
+
+    try {
+      await publish({ kitId, stage: 'failed', message });
+    } catch {
+      logger.warn('generation.progress_publish_failed', { kitId, stage: 'failed' });
+    }
+
     logger.error(error, 'generation.job_failed');
     throw error;
   }
@@ -79,7 +98,12 @@ export default async function processKitGeneration(job: Job<GenerationJobData>):
 
   await runGenerationJob(job.data, {
     kitRepository: container.kitRepository(),
-    generation: container.kitGenerationService(),
+    // Deferred: resolving the generation service builds the LLM adapter,
+    // which throws when unconfigured. It must throw inside runGenerationJob
+    // (after the researching stage persists), never before it.
+    generation: {
+      generate: (input) => container.kitGenerationService().generate(input),
+    },
     publish: (event) => publishProgress(redisClient, event),
     logger,
   });

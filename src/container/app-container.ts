@@ -27,7 +27,8 @@ import { RedisBraveGate } from '@/modules/research/search/brave-gate';
 import type { PublicSearchProvider } from '@/modules/research/search/search.type';
 import { PublicDiscussionResearchService } from '@/modules/research/discussion/public-discussion-research.service';
 import { CompanyResearchService } from '@/modules/research/company-research.service';
-import { GeminiService } from '@/modules/generation/gemini.service';
+import { resolveLlmAdapter } from '@/modules/generation/llm/resolve-llm-adapter';
+import type { LlmGenerationAdapter } from '@/modules/generation/llm/llm-adapter';
 import { KitGenerationService } from '@/modules/generation/kit-generation.service';
 import { createGenerationQueue } from '@/modules/generation/kit-generation.queue';
 import type { Queue } from 'bullmq';
@@ -61,7 +62,7 @@ export type AppContainer = {
   publicSearchProvider: Provider<PublicSearchProvider | null>;
   publicDiscussionResearchService: Provider<PublicDiscussionResearchService>;
   companyResearchService: Provider<CompanyResearchService>;
-  geminiService: Provider<GeminiService>;
+  llmAdapter: Provider<LlmGenerationAdapter>;
   kitGenerationService: Provider<KitGenerationService>;
   generationQueue: Provider<Queue<GenerationJobData>>;
 };
@@ -217,22 +218,27 @@ export const createAppContainer = (config: AppConfig): AppContainer => {
       }),
   );
 
-  // Lazy: constructing the Gemini client never touches the network, and the
-  // service throws a clear NOT_CONFIGURED error only when actually used.
-  const geminiService = singleton(
-    () =>
-      new GeminiService({
-        apiKey: config.geminiApiKey,
-        model: config.geminiModel,
-        logger: logger(),
-      }),
+  // Lazy: exactly one provider is selected per process (explicit
+  // LLM_PROVIDER or single-credential auto-detect); construction never
+  // touches the network. No runtime fallback between providers.
+  const llmAdapter = singleton(() =>
+    resolveLlmAdapter(
+      {
+        llmProvider: config.llmProvider,
+        openaiApiKey: config.openaiApiKey,
+        openaiModel: config.openaiModel,
+        geminiApiKey: config.geminiApiKey,
+        geminiModel: config.geminiModel,
+      },
+      { logger: logger() },
+    ),
   );
 
   const kitGenerationService = singleton(
     () =>
       new KitGenerationService({
         research: companyResearchService(),
-        gemini: geminiService(),
+        llm: llmAdapter(),
         logger: logger(),
       }),
   );
@@ -246,7 +252,7 @@ export const createAppContainer = (config: AppConfig): AppContainer => {
       new KitService({
         kitRepository: kitRepository(),
         generationQueue: generationQueue(),
-        kitGeneration: kitGenerationService(),
+        kitGeneration: kitGenerationService,
         research: companyResearchService(),
         logger: logger(),
       }),
@@ -277,7 +283,7 @@ export const createAppContainer = (config: AppConfig): AppContainer => {
     publicSearchProvider,
     publicDiscussionResearchService,
     companyResearchService,
-    geminiService,
+    llmAdapter,
     kitGenerationService,
     generationQueue,
   };

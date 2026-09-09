@@ -32,14 +32,17 @@ import type {
 import type { EditorMeta, KitDocument } from '@/modules/kit/kit.model';
 import type { KitRepository } from '@/modules/kit/kit.repository';
 import type { InterviewKit, KitFlashcard, KitQuestion } from '@/modules/kit/kit.type';
+import type { Provider } from '@/common/providers/provider';
 import { prepareSchedule } from '@/modules/schedule/schedule.service';
 
 export type KitServiceDependencies = {
   kitRepository: KitRepository;
   generationQueue: Queue<GenerationJobData>;
-  kitGeneration: Pick<
-    KitGenerationService,
-    'generateBrief' | 'generateCategoryQuestions' | 'validateEditedKit'
+  // Lazy provider: resolving the generation service builds the LLM adapter,
+  // which throws when unconfigured. createKit must work without keys (the
+  // worker reports the config error on the job instead).
+  kitGeneration: Provider<
+    Pick<KitGenerationService, 'generateBrief' | 'generateCategoryQuestions' | 'validateEditedKit'>
   >;
   research: Pick<CompanyResearchService, 'researchCompany'>;
   logger: LoggerService;
@@ -204,11 +207,9 @@ export class KitService {
   async addQuestion(userId: string, kitId: string, input: AddQuestionInput): Promise<InterviewKit> {
     return this.mutateKit(userId, kitId, (kit, meta, sequences) => {
       const requirementIds = new Set(kit.role.requirements.map((entry) => entry.id));
+      // Manual questions may legitimately reference nothing: thin kits have
+      // zero requirements, and no fake mapping is invented here.
       const refs = [...new Set(input.requirement_ids ?? [])].filter((id) => requirementIds.has(id));
-
-      if (refs.length === 0) {
-        throw new BadRequestException('A question must reference a real requirement.');
-      }
 
       const draft: QuestionDraft = {
         prompt: input.prompt,
@@ -398,7 +399,7 @@ export class KitService {
       const context = await this.freshResearchContext(doc, content);
 
       if (input.section === 'company_brief') {
-        const brief = await this.dependencies.kitGeneration.generateBrief(
+        const brief = await this.dependencies.kitGeneration().generateBrief(
           content.role.title,
           content.role.requirements,
           context,
@@ -414,7 +415,7 @@ export class KitService {
           sources: context.pagesUsed,
         };
       } else {
-        const fresh = await this.dependencies.kitGeneration.generateCategoryQuestions(
+        const fresh = await this.dependencies.kitGeneration().generateCategoryQuestions(
           input.category,
           content.role.title,
           content.role.requirements,
@@ -437,14 +438,18 @@ export class KitService {
 
         content.questions = [...preserved, ...created];
 
-        // Dropped unedited questions leave the schedule; minutes follow the
-        // same 30-minutes-per-question rule as initial allocation.
-        const kept = new Set(content.questions.map((question) => question.id));
-
-        for (const day of content.schedule.days) {
-          day.question_ids = day.question_ids.filter((id) => kept.has(id));
-          day.minutes = day.question_ids.length * 30;
-        }
+        // The question set changed: rebuild the deterministic schedule from
+        // ALL final questions instead of patching old day allocations. Days
+        // stay exact, every final question is allocated, and must coverage is
+        // enforced (an uncovered must fails the regen visibly, kit untouched).
+        content.schedule = {
+          days_available: doc.input.days,
+          days: prepareSchedule({
+            requirements: content.role.requirements,
+            questions: content.questions,
+            daysAvailable: doc.input.days,
+          }).schedule.days,
+        };
 
         content.coverage = {
           uncovered_requirement_ids: calculateCoverage(content.role.requirements, content.questions)
@@ -454,7 +459,7 @@ export class KitService {
       }
     }
 
-    const validated = this.dependencies.kitGeneration.validateEditedKit(content);
+    const validated = this.dependencies.kitGeneration().validateEditedKit(content);
     const saved = await this.dependencies.kitRepository.saveEditedKit(
       userId,
       kitId,
@@ -498,7 +503,7 @@ export class KitService {
     const sequences = { ...doc.idSequences };
 
     const nextMeta = apply(content, meta, sequences);
-    const validated = this.dependencies.kitGeneration.validateEditedKit(content);
+    const validated = this.dependencies.kitGeneration().validateEditedKit(content);
     const saved = await this.dependencies.kitRepository.saveEditedKit(
       userId,
       kitId,

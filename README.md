@@ -182,15 +182,26 @@ Gemini, validates, repairs coverage, schedules, and persists → frontend polls
 - Worker thread: BullMQ `useWorkerThreads` with the external compiled processor
   (`dist/modules/generation/kit-generation.processor.js`). Boot the API from `dist`
   (`npm run build && npm start`); dev must build first or the worker refuses to start.
+  A worker that cannot start aborts boot — the API never listens half-capable.
   Same deployment — no second service; needs Node `worker_threads` allowed.
-- Progress: Redis Pub/Sub channel `kit-generation-progress` is best-effort only.
-  Mongo kit `status`/`stage` is the source of truth for `GET /status`.
+- Progress: Redis Pub/Sub channel `kit-generation-progress` is best-effort only
+  (publish failures log and continue). Mongo kit `status`/`stage` is the source of
+  truth for `GET /status`.
+- Redis: ioredis is the only client, configured by `REDIS_URL` alone (no host/port
+  split). Shared command connection + BullMQ connections (`maxRetriesPerRequest:
+  null`) + dedicated subscriber duplicate.
 - Brave Search (2 req/s plan): every HTTP attempt passes a shared start gate
   (`BRAVE_MIN_REQUEST_INTERVAL_MS = 600`, Redis `SET NX PX` across API/worker,
   in-process gate in the evaluator), ≤3 sequential queries, 2 attempts, 429/backoff
   respected. Absent key → structured unavailable, never fabricated.
-- LLM: one Gemini provider (`GEMINI_API_KEY`, `GEMINI_MODEL`), Axios,
-  `responseMimeType: application/json`, Zod-validated, 2 attempts.
+- LLM: one `LlmGenerationAdapter` contract with two providers — OpenAI
+  (`OPENAI_API_KEY`/`OPENAI_MODEL`, chat completions + `response_format json_object`)
+  and Gemini (`GEMINI_API_KEY`/`GEMINI_MODEL`, `responseMimeType application/json`).
+  Selection: `LLM_PROVIDER=openai|gemini`, or auto-detect when exactly one pair is
+  configured; both pairs without `LLM_PROVIDER`, or none, is a config error. No
+  runtime fallback: a provider failure retries that provider (2 attempts) then fails
+  gracefully. Keys never logged. No provider/model is configured in this repo by
+  default — set them in `.env` (never commit).
 - Retrieval: Axios-only hardened client (SSRF DNS binding, `proxy: false`, 15s total
   deadline, redirect scope/robots guards, robots.txt respected, Cheerio extraction,
   content marked `external-untrusted`, prompts treat JD/research as data).
@@ -198,18 +209,28 @@ Gemini, validates, repairs coverage, schedules, and persists → frontend polls
   → brief + flashcards (one call) → four separate category calls → deterministic
   coverage + exactly one repair pass (final uncovered MUST is `[]`) → deterministic
   schedule for the exact day count → canonical validation.
+- Thin JD: a JD with no extractable criteria yields an honest kit — possibly zero
+  requirements/questions/flashcards, exact-day schedule with empty days (`Review
+  available role and company context`, 0 minutes), coverage `{uncovered: [], passes:
+  1}`. Nothing is invented to fill it.
 - Editor preservation: `pinned`/`edited`/`manual` question flags and edited brief fields
   live in `editorMeta` outside the strict canonical kit; regeneration replaces only
-  unedited content and reuses high-water IDs.
+  unedited content, rebuilds the schedule from all final questions, and reuses
+  high-water IDs. Manual questions may reference zero requirements.
 - Practice: completed kits only; weakest-first (unpractised → lowest confidence →
-  original order); confidence persists via practice records.
-- Evaluator (no Mongo/BullMQ/auth): `npm run evaluate -- --input <cases.json> --output
-  <kits.json>` reuses the same `KitGenerationService` sequentially and writes
-  `{version: "1.0", generated_at, kits}` Appendix B output.
+  original order, position resets after each record so no card is skipped);
+  confidence persists via practice records.
+- Evaluator (no Mongo/BullMQ/auth): `npm run evaluate -- --input <cases.json>
+  --output <kits.json>` reuses the same service sequentially (`mode = evaluation`,
+  localhost company URLs allowed) and writes `{version: "1.0", generated_at, kits:
+  [{id, status, kit, error}]}` with `error: null` on success. Input cases use
+  `company_url` (not `companyUrl`).
 
 Env: `PORT, FRONTEND_ORIGIN, MONGODB_URI, REDIS_URL, SESSION_SECRET,
-BRAVE_SEARCH_API_KEY (optional), GEMINI_API_KEY, GEMINI_MODEL`.
+BRAVE_SEARCH_API_KEY (optional), LLM_PROVIDER, OPENAI_API_KEY, OPENAI_MODEL,
+GEMINI_API_KEY, GEMINI_MODEL`.
 
 Known limitations: regeneration re-runs live research (costs Brave quota per click);
 single worker means one kit generates at a time; Pub/Sub progress can drop messages
-(`GET /status` stays correct).
+(`GET /status` stays correct); generation and live evaluator runs require real LLM
+credentials.
