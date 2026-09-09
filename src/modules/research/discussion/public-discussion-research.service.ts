@@ -3,13 +3,15 @@ import type { LoggerService } from '@/infrastructure/logger/logger.service';
 import type { LinkDiscoveryService } from '@/modules/research/crawl/link-discovery.service';
 import { CRAWL_MIN_REQUEST_INTERVAL_MS } from '@/modules/research/crawl/crawl.constants';
 import type { PageExtractionService } from '@/modules/research/extraction/page-extraction.service';
+import { RedirectBlockedError } from '@/modules/research/retrieval/retrieval.exception';
 import type {
   RetrievalClient,
   Sleep,
   Clock,
 } from '@/modules/research/retrieval/retrieval-client.service';
+import type { RedirectGuard, RetrievalResult } from '@/modules/research/retrieval/retrieval.type';
 import type { RobotsPolicyService } from '@/modules/research/robots/robots-policy.service';
-import type { RobotsPolicyCache } from '@/modules/research/robots/robots.type';
+import type { RobotsPolicy, RobotsPolicyCache } from '@/modules/research/robots/robots.type';
 import type {
   PublicSearchProvider,
   PublicSearchResult,
@@ -271,10 +273,6 @@ export class PublicDiscussionResearchService {
 
           const existing = bestByUrl.get(normalized);
 
-          if (existing === undefined && bestByUrl.size >= MAX_UNIQUE_SEARCH_RESULTS) {
-            continue;
-          }
-
           if (!existing || result.rank < existing.result.rank) {
             bestByUrl.set(normalized, { result, query });
           }
@@ -285,6 +283,9 @@ export class PublicDiscussionResearchService {
     }
 
     const companyScope = this.companyScope(input.companyUrl);
+    // The unique cap applies after normalize → dedupe → company exclusion →
+    // rank, so a highly relevant role-query result can never be starved by
+    // earlier queries filling the cap first.
     const ranked = rankDiscussionResults(
       [...bestByUrl.entries()].map(([normalized, entry]) => ({
         result: entry.result,
@@ -292,13 +293,22 @@ export class PublicDiscussionResearchService {
         normalized,
       })),
       input.roleHint,
-    ).filter((entry) => !this.isCompanyOwned(entry.normalized, companyScope));
+    )
+      .filter((entry) => !this.isCompanyOwned(entry.normalized, companyScope))
+      .slice(0, MAX_UNIQUE_SEARCH_RESULTS);
 
     const uniqueResults = ranked.length;
     const selected = this.selectSources(ranked);
     const robotsCache: RobotsPolicyCache = new Map();
     const lastStartByOrigin = new Map<string, number>();
     const originDelays = new Map<string, number>();
+    // Origins already committed to page fetches; the redirect guard refuses
+    // targets that would open a new origin beyond the budget.
+    const fetchOrigins = new Set(
+      selected
+        .map((entry) => this.originOf(entry.normalized))
+        .filter((origin): origin is string => origin !== null),
+    );
     const sources: DiscussionSource[] = [];
     let pagesAttempted = 0;
     let pagesFetched = 0;
@@ -343,15 +353,7 @@ export class PublicDiscussionResearchService {
         originDelays.set(origin, policy.crawlDelayMs);
       }
 
-      let allowed: boolean;
-
-      try {
-        allowed = this.robotsPolicy.isUrlAllowed(policy, entry.normalized);
-      } catch {
-        allowed = false;
-      }
-
-      if (!allowed) {
+      if (!this.allowUrl(policy, entry.normalized)) {
         source.fetchStatus = 'robots-skipped';
         pagesSkipped += 1;
         failures.push({
@@ -364,10 +366,44 @@ export class PublicDiscussionResearchService {
       }
 
       await this.paceOrigin(origin, lastStartByOrigin, originDelays);
-      const pageResult = await this.retrievalClient.retrieve({
-        url: entry.normalized,
-        mode: input.mode,
-      });
+
+      let pageResult: RetrievalResult;
+
+      try {
+        pageResult = await this.retrievalClient.retrieve({
+          url: entry.normalized,
+          mode: input.mode,
+          onBeforeRedirect: this.discussionRedirectGuard(input.mode, robotsCache, fetchOrigins),
+        });
+      } catch (error) {
+        // The redirect guard rejected a target before it was fetched.
+        if (!(error instanceof RedirectBlockedError)) {
+          throw error;
+        }
+
+        if (error.reason === 'ROBOTS_DISALLOWED') {
+          source.fetchStatus = 'robots-skipped';
+          pagesSkipped += 1;
+          failures.push({
+            source: 'page',
+            query: entry.query,
+            url: entry.normalized,
+            code: 'ROBOTS_DISALLOWED',
+          });
+        } else {
+          source.fetchStatus = 'failed';
+          pagesFailed += 1;
+          failures.push({
+            source: 'page',
+            query: entry.query,
+            url: entry.normalized,
+            code: 'RETRIEVAL_FAILED',
+            detail: 'Redirect target outside the discussion origin budget.',
+          });
+        }
+
+        continue;
+      }
 
       if (!pageResult.ok) {
         source.fetchStatus = 'failed';
@@ -400,7 +436,11 @@ export class PublicDiscussionResearchService {
         continue;
       }
 
-      source.page = { content };
+      source.page = {
+        requestedUrl: entry.normalized,
+        finalUrl: pageResult.resource.finalUrl,
+        content,
+      };
       source.fetchStatus = 'fetched';
       pagesFetched += 1;
 
@@ -412,8 +452,16 @@ export class PublicDiscussionResearchService {
     }
 
     // Unselected ranked results stay visible as search evidence with their
-    // snippets; only the bounded top set is fetched.
-    for (const entry of ranked.slice(selected.length)) {
+    // snippets; only the bounded top set is fetched. Partitioned by
+    // normalized identity: origin limits can skip middle entries, so position
+    // never implies selection and every source appears exactly once.
+    const selectedUrls = new Set(selected.map((entry) => entry.normalized));
+
+    for (const entry of ranked) {
+      if (selectedUrls.has(entry.normalized)) {
+        continue;
+      }
+
       sources.push({
         title: entry.result.title,
         url: entry.normalized,
@@ -498,6 +546,39 @@ export class PublicDiscussionResearchService {
         pagesFailed,
       },
     };
+  }
+
+  // Redirect policy for selected discussion pages: every redirect target
+  // passes the target origin's robots policy before any request to it, and
+  // targets that would open a new origin beyond the budget are refused.
+  private discussionRedirectGuard(
+    mode: PublicDiscussionResearchInput['mode'],
+    robotsCache: RobotsPolicyCache,
+    fetchOrigins: Set<string>,
+  ): RedirectGuard {
+    return async (next) => {
+      const policy = await this.robotsPolicy.loadPolicy(next.origin, mode, robotsCache);
+
+      if (!this.allowUrl(policy, next.toString())) {
+        throw new RedirectBlockedError('ROBOTS_DISALLOWED', next.toString());
+      }
+
+      if (!fetchOrigins.has(next.origin)) {
+        if (fetchOrigins.size >= MAX_DISCUSSION_ORIGINS) {
+          throw new RedirectBlockedError('OUT_OF_SCOPE', next.toString());
+        }
+
+        fetchOrigins.add(next.origin);
+      }
+    };
+  }
+
+  private allowUrl(policy: RobotsPolicy, url: string): boolean {
+    try {
+      return this.robotsPolicy.isUrlAllowed(policy, url);
+    } catch {
+      return false;
+    }
   }
 
   private searchFailure(query: string, error: unknown): DiscussionFailure {

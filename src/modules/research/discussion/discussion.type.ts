@@ -21,6 +21,8 @@ export type DiscussionSource = {
     snippet: string | null;
   };
   page?: {
+    requestedUrl: string;
+    finalUrl: string;
     content: ExtractedPageContent;
   };
   fetchStatus: DiscussionFetchStatus;

@@ -24,6 +24,7 @@ import { PageExtractionService } from '@/modules/research/extraction/page-extrac
 import { BraveSearchProvider } from '@/modules/research/search/brave-search.provider';
 import type { PublicSearchProvider } from '@/modules/research/search/search.type';
 import { PublicDiscussionResearchService } from '@/modules/research/discussion/public-discussion-research.service';
+import { CompanyResearchService } from '@/modules/research/company-research.service';
 import { UserModel } from '@/modules/user/user.model';
 import { UserRepository } from '@/modules/user/user.repository';
 import type { RequestHandler } from 'express';
@@ -52,6 +53,7 @@ export type AppContainer = {
   pageExtractionService: Provider<PageExtractionService>;
   publicSearchProvider: Provider<PublicSearchProvider | null>;
   publicDiscussionResearchService: Provider<PublicDiscussionResearchService>;
+  companyResearchService: Provider<CompanyResearchService>;
 };
 
 export const createAppContainer = (config: AppConfig): AppContainer => {
@@ -195,6 +197,15 @@ export const createAppContainer = (config: AppConfig): AppContainer => {
       }),
   );
 
+  const companyResearchService = singleton(
+    () =>
+      new CompanyResearchService({
+        companyCrawler: companyCrawlerService(),
+        discussionResearch: publicDiscussionResearchService(),
+        logger: logger(),
+      }),
+  );
+
   return {
     requestContext,
     logger,
@@ -219,5 +230,6 @@ export const createAppContainer = (config: AppConfig): AppContainer => {
     pageExtractionService,
     publicSearchProvider,
     publicDiscussionResearchService,
+    companyResearchService,
   };
 };

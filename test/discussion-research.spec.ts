@@ -818,3 +818,178 @@ describe('local discussion integration', () => {
     }
   });
 });
+
+describe('p2.5 carry-forward fixes', () => {
+  const scriptHttp = (
+    steps: Array<{ status: number; headers?: Record<string, string>; body?: string }>,
+    seen: string[],
+  ): HttpGetter => {
+    const remaining = [...steps];
+    return async (url: string) => {
+      seen.push(url);
+      const step = remaining.shift();
+
+      if (!step) {
+        throw new Error('http script exhausted');
+      }
+
+      return {
+        status: step.status,
+        headers: { 'content-type': 'text/html', ...(step.headers ?? {}) },
+        body: step.body ?? '',
+      };
+    };
+  };
+
+  const guardedService = (
+    steps: Array<{ status: number; headers?: Record<string, string>; body?: string }>,
+    seen: string[],
+    provider: PublicSearchProvider,
+  ): PublicDiscussionResearchService => {
+    const http = scriptHttp(steps, seen);
+    const client = new RetrievalClient({
+      urlSafety: new UrlSafetyService(),
+      logger: makeLogger(),
+      httpGet: http,
+      sleep: async () => {},
+      random: () => 0,
+    });
+
+    return new PublicDiscussionResearchService({
+      searchProvider: provider,
+      retrievalClient: client,
+      robotsPolicy: new RobotsPolicyService({ retrievalClient: client, logger: makeLogger() }),
+      pageExtraction: new PageExtractionService(),
+      linkDiscovery: new LinkDiscoveryService(),
+      logger: makeLogger(),
+      sleep: async () => {},
+    });
+  };
+
+  it('9a. discussion redirect to a robots-disallowed page is never fetched', async () => {
+    const seen: string[] = [];
+    const service = guardedService(
+      [
+        { status: 200, body: 'User-agent: *\nDisallow: /secret\n' },
+        { status: 302, headers: { location: '/secret' } },
+      ],
+      seen,
+      scriptProvider([result('http://127.0.0.1:18201/go', 'Acme interview', 'snippet', 0)]),
+    );
+
+    const outcome = await service.research(discuss('https://acme.example/'));
+
+    expect(seen).toEqual(['http://127.0.0.1:18201/robots.txt', 'http://127.0.0.1:18201/go']);
+    expect(outcome.sources).toHaveLength(1);
+    expect(outcome.sources[0]?.fetchStatus).toBe('robots-skipped');
+    expect(outcome.sources[0]?.search.snippet).toBe('snippet');
+    expect(outcome.sources[0]?.page).toBeUndefined();
+    expect(outcome.failures.some((failure) => failure.code === 'ROBOTS_DISALLOWED')).toBe(true);
+  });
+
+  it('9b. safe discussion redirect succeeds with requested/final provenance', async () => {
+    const seen: string[] = [];
+    const service = guardedService(
+      [
+        { status: 200, body: 'User-agent: *\nDisallow:\n' },
+        { status: 302, headers: { location: '/real' } },
+        { status: 200, body: '<p>real discussion notes</p>' },
+      ],
+      seen,
+      scriptProvider([result('http://127.0.0.1:18202/go', 'Acme interview', 'snippet', 0)]),
+    );
+
+    const outcome = await service.research(discuss('https://acme.example/'));
+
+    expect(seen).toEqual([
+      'http://127.0.0.1:18202/robots.txt',
+      'http://127.0.0.1:18202/go',
+      'http://127.0.0.1:18202/real',
+    ]);
+    expect(outcome.sources[0]?.fetchStatus).toBe('fetched');
+    expect(outcome.sources[0]?.page?.requestedUrl).toBe('http://127.0.0.1:18202/go');
+    expect(outcome.sources[0]?.page?.finalUrl).toBe('http://127.0.0.1:18202/real');
+    expect(outcome.sources[0]?.page?.content.text).toContain('real discussion notes');
+  });
+
+  it('10. role-query result survives the unique cap after final ranking', async () => {
+    const fillers = (tag: string, offset: number): PublicSearchResult[] =>
+      Array.from({ length: 5 }, (_, index) =>
+        result(
+          `https://${tag}.example/n${index}`,
+          `Acme company update ${offset + index}`,
+          'news',
+          index,
+        ),
+      );
+    const roleResult = result(
+      'https://forum.example/backend-interview',
+      'Acme Backend Engineer interview experience',
+      'my backend onsite',
+      0,
+    );
+    const service = makeService(
+      scriptProvider((query: string) => {
+        if (query.includes('Backend Engineer')) {
+          return [roleResult];
+        }
+
+        return query.includes('experience') ? fillers('news-a', 0) : fillers('news-b', 5);
+      }),
+      stubRetrieval(
+        {
+          'https://forum.example/backend-interview': { body: '<p>backend onsite</p>' },
+          ...Object.fromEntries(
+            ['news-a', 'news-b'].flatMap((tag) =>
+              Array.from({ length: 5 }, (_, index) => [
+                `https://${tag}.example/n${index}`,
+                { body: '<p>news</p>' },
+              ]),
+            ),
+          ),
+        },
+        [],
+      ),
+    );
+
+    const outcome = await service.research(
+      discuss('https://acme.example/', { roleHint: 'Backend Engineer' }),
+    );
+
+    const roleSource = outcome.sources.find(
+      (source) => source.url === 'https://forum.example/backend-interview',
+    );
+    expect(roleSource?.fetchStatus).toBe('fetched');
+    expect(outcome.sources[0]?.url).toBe('https://forum.example/backend-interview');
+  });
+
+  it('11. origin-limit skip in the middle yields no duplicate or missing source', async () => {
+    const entries = [
+      result('https://o1.example/a', 'Acme interview note', 's', 0),
+      result('https://o2.example/b', 'Acme interview note', 's', 1),
+      result('https://o3.example/c', 'Acme interview note', 's', 2),
+      result('https://o4.example/d', 'Acme interview note', 's', 3),
+      result('https://o5.example/e', 'Acme interview note', 's', 4),
+      result('https://o1.example/f', 'Acme interview note', 's', 5),
+    ];
+    const service = makeService(
+      scriptProvider(entries),
+      stubRetrieval(
+        Object.fromEntries(entries.map((entry) => [entry.url, { body: '<p>notes</p>' }])),
+        [],
+      ),
+    );
+
+    const outcome = await service.research(discuss());
+
+    expect(outcome.sources).toHaveLength(6);
+    expect(new Set(outcome.sources.map((source) => source.url)).size).toBe(6);
+    expect(
+      outcome.sources.find((source) => source.url === 'https://o5.example/e')?.fetchStatus,
+    ).toBe('not-attempted');
+    expect(
+      outcome.sources.find((source) => source.url === 'https://o1.example/f')?.fetchStatus,
+    ).toBe('fetched');
+    expect(outcome.stats.pagesAttempted).toBe(5);
+  });
+});
