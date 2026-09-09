@@ -369,4 +369,4 @@ Frontend repository:
 https://github.com/nandymandy1/interview-prep-web
 
 Walkthrough video:
-[To be added before submission]
+https://drive.google.com/file/d/11KwL8ugSSeCx9sIyq4DmFOCxlO14DlLn/view
