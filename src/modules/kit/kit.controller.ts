@@ -92,6 +92,21 @@ export class KitController {
     res.status(200).json(response);
   }
 
+  async retry(req: Request, res: Response): Promise<void> {
+    const result = await this.dependencies.kitService.retryGeneration(
+      this.requireUserId(req),
+      req.params.kitId as string,
+      this.idempotencyKey(req),
+    );
+
+    const response: ApiSuccessResponse<CreateKitResult> = {
+      success: true,
+      data: result,
+    };
+
+    res.status(200).json(response);
+  }
+
   async recordPractice(req: Request, res: Response): Promise<void> {
     const result = await this.dependencies.kitService.recordPractice(
       this.requireUserId(req),

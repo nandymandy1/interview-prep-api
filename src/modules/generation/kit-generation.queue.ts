@@ -64,6 +64,22 @@ export const enqueueKitGeneration = async (
   });
 };
 
+// User-controlled retry of the SAME kit: a failed attempt leaves its BullMQ
+// job behind, and re-adding the same jobId would collide. Remove the stale
+// job first so exactly one active generation job exists for the kit.
+export const requeueKitGeneration = async (
+  queue: Queue<GenerationJobData>,
+  data: GenerationJobData,
+): Promise<void> => {
+  const existing = await queue.getJob(data.kitId);
+
+  if (existing) {
+    await existing.remove();
+  }
+
+  await enqueueKitGeneration(queue, data);
+};
+
 export const startGenerationWorker = (
   redisUrl: string,
   logger: QueueLogger,

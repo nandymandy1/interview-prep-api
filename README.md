@@ -207,8 +207,8 @@ null`) + dedicated subscriber duplicate.
 - Retrieval: Axios-only hardened client (SSRF DNS binding, `proxy: false`, 15s total
   deadline, redirect scope/robots guards, robots.txt respected, Cheerio extraction,
   content marked `external-untrusted`, prompts treat JD/research as data).
-- Generation sequence: JD-only requirement extraction (IDs in code) → company research
-  (cached 24h by canonical URL + version + mode) → brief + flashcards (one call,
+- Generation sequence: company research first (cached 24h by canonical URL + version + mode,
+  generic — no role hint) → JD-only requirement extraction (IDs in code) → brief + flashcards (one call,
   flashcards reference ONLY listed `id [priority][kind]: text` mappings) → four
   separate category calls (skipped entirely when zero requirements) →
   deterministic coverage + exactly one repair pass (final uncovered MUST is `[]`) →
@@ -252,7 +252,8 @@ GEMINI_API_KEY, GEMINI_MODEL, GENERATION_CACHE_TTL_DAYS (default 7),
 RESEARCH_CACHE_TTL_HOURS (default 24)`.
 
 Submitted provider/model: none configured in this repo by default (set in `.env`,
-never commit). Production should set `LLM_PROVIDER=openai` with its pair.
+never commit). Generation is performed through the configured LLM adapter
+(OpenAI or Gemini). Production configuration can select OpenAI.
 
 Known limitations: regeneration re-runs live research on a research-cache miss
 (costs Brave quota per click); single worker means one kit generates at a time;

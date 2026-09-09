@@ -466,6 +466,7 @@ describe('kit status and practice', () => {
         steps: [
           { key: 'queued', label: 'Queued', state: 'pending' },
           { key: 'researching', label: 'Researching company', state: 'pending' },
+          { key: 'analyzing-jd', label: 'Analyzing job description', state: 'pending' },
           { key: 'generating', label: 'Generating interview kit', state: 'pending' },
           { key: 'checking-coverage', label: 'Checking coverage', state: 'pending' },
           { key: 'building-schedule', label: 'Building schedule', state: 'pending' },
@@ -473,6 +474,45 @@ describe('kit status and practice', () => {
         updatedAt: '2026-09-08T00:00:00.000Z',
       },
     });
+  });
+
+  it('marks Analyzing job description failed after completed research', async () => {
+    const repository = ownedRepository();
+    repository.findOwnedById.mockResolvedValue(
+      kitDoc({
+        status: 'failed',
+        stage: 'analyzing-jd',
+        stageMessage: 'OpenAI is temporarily rate-limiting requests. Please retry in a moment.',
+        error: {
+          code: 'OPENAI_RATE_LIMITED',
+          message: 'OpenAI is temporarily rate-limiting requests. Please retry in a moment.',
+        },
+      }),
+    );
+    const response = await request(buildApp(repository, USER_A)).get(`/api/kits/${KIT_A}/status`);
+
+    expect(response.status).toBe(200);
+    expect(response.body.data).toMatchObject({
+      kitId: KIT_A,
+      status: 'failed',
+      error: {
+        code: 'OPENAI_RATE_LIMITED',
+        message: 'OpenAI is temporarily rate-limiting requests. Please retry in a moment.',
+      },
+    });
+    expect(response.body.data.steps).toEqual([
+      { key: 'queued', label: 'Queued', state: 'completed' },
+      { key: 'researching', label: 'Researching company', state: 'completed' },
+      {
+        key: 'analyzing-jd',
+        label: 'Analyzing job description',
+        state: 'failed',
+        message: 'OpenAI is temporarily rate-limiting requests. Please retry in a moment.',
+      },
+      { key: 'generating', label: 'Generating interview kit', state: 'pending' },
+      { key: 'checking-coverage', label: 'Checking coverage', state: 'pending' },
+      { key: 'building-schedule', label: 'Building schedule', state: 'pending' },
+    ]);
   });
 
   it('records practice against a completed owned kit', async () => {

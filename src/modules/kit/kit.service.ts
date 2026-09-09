@@ -7,7 +7,10 @@ import {
 import type { LoggerService } from '@/infrastructure/logger/logger.service';
 import type { PaginatedResult, PaginationQuery } from '@/common/types/pagination.type';
 import { calculateCoverage } from '@/modules/coverage/coverage.service';
-import { enqueueKitGeneration } from '@/modules/generation/kit-generation.queue';
+import {
+  enqueueKitGeneration,
+  requeueKitGeneration,
+} from '@/modules/generation/kit-generation.queue';
 import type { GenerationJobData } from '@/modules/generation/generation.type';
 import type { KitGenerationService } from '@/modules/generation/kit-generation.service';
 import { buildResearchContext } from '@/modules/generation/research-context';
@@ -56,6 +59,7 @@ export type KitServiceDependencies = {
 const STATUS_STEPS: ReadonlyArray<{ key: string; label: string }> = [
   { key: 'queued', label: 'Queued' },
   { key: 'researching', label: 'Researching company' },
+  { key: 'analyzing-jd', label: 'Analyzing job description' },
   { key: 'generating', label: 'Generating interview kit' },
   { key: 'checking-coverage', label: 'Checking coverage' },
   { key: 'building-schedule', label: 'Building schedule' },
@@ -234,6 +238,121 @@ export class KitService {
     }
 
     throw new ConflictException('This create request is already being processed.');
+  }
+
+  // User-controlled retry of a FAILED kit: reuses the same kitId and the
+  // already-persisted inputs (jd, companyUrl, days), clears the previous
+  // failure, resets status to queued, and leaves exactly one active
+  // generation job. Only failed kits retry; anything else is a 409. With an
+  // Idempotency-Key, transport repeats replay instead of re-enqueueing.
+  async retryGeneration(
+    userId: string,
+    kitId: string,
+    idempotencyKey?: string,
+  ): Promise<CreateKitResult> {
+    const operation = `kit:${kitId}:retry-generation`;
+    const kit = await this.requireOwnedKit(userId, kitId);
+
+    if (idempotencyKey) {
+      const replay = await this.replayRetry(userId, operation, idempotencyKey, kit.id, kit.status);
+
+      if (replay) {
+        return replay;
+      }
+    }
+
+    if (kit.status !== 'failed') {
+      // A claimed key that never executes must not block the key: release it
+      // so the same key stays usable.
+      if (idempotencyKey) {
+        await this.dependencies.idempotency.fail(userId, operation, idempotencyKey);
+      }
+
+      throw new ConflictException('Only a failed kit can be retried.');
+    }
+
+    await this.dependencies.kitRepository.updateGenerationState(userId, kitId, {
+      status: 'queued',
+      stage: 'queued',
+      stageMessage: 'Retry queued.',
+      error: null,
+    });
+
+    try {
+      await requeueKitGeneration(this.dependencies.generationQueue, {
+        kitId: kit.id,
+        userId,
+        jd: kit.input.jd,
+        companyUrl: kit.input.companyUrl,
+        days: kit.input.days,
+      });
+    } catch (error) {
+      await this.dependencies.kitRepository.updateGenerationState(userId, kitId, {
+        status: 'failed',
+        stageMessage: 'Could not enqueue generation.',
+        error: { code: 'ENQUEUE_FAILED', message: 'Could not start generation. Try again.' },
+      });
+
+      if (idempotencyKey) {
+        await this.dependencies.idempotency.fail(userId, operation, idempotencyKey);
+      }
+
+      throw error;
+    }
+
+    if (idempotencyKey) {
+      await this.dependencies.idempotency.complete(userId, operation, idempotencyKey);
+    }
+
+    this.dependencies.logger.info('kit.retry_queued', {
+      userId,
+      kitId,
+      retryAction: true,
+      ...(idempotencyKey ? { idempotencyKeyPrefix: idempotencyKeyPrefix(idempotencyKey) } : {}),
+    });
+
+    return { kitId: kit.id, status: 'queued' };
+  }
+
+  // Same key repeated → the current kit status without a second BullMQ job.
+  // The claim lands before any side effect, so a lost claim race replays the
+  // winner; failed records re-run under the same key.
+  private async replayRetry(
+    userId: string,
+    operation: string,
+    key: string,
+    kitId: string,
+    status: CreateKitResult['status'],
+  ): Promise<CreateKitResult | null> {
+    const { idempotency } = this.dependencies;
+    const existing = await idempotency.find(userId, operation, key);
+
+    if (existing?.status === 'completed' || existing?.status === 'processing') {
+      if (existing.resourceId && existing.resourceId !== kitId) {
+        throw new ConflictException('This retry key was already used for another kit.');
+      }
+
+      // Only the claim winner below may execute; every other holder of the
+      // key replays the live status without touching the queue.
+      return { kitId, status };
+    }
+
+    if (existing?.status === 'failed') {
+      return null;
+    }
+
+    if (!existing) {
+      const claim = await idempotency.claim(userId, operation, key);
+
+      if (!claim.claimed) {
+        return this.replayRetry(userId, operation, key, kitId, status);
+      }
+
+      await idempotency.attachResource(userId, operation, key, kitId);
+      return null;
+    }
+
+    return null;
   }
 
   async getKit(userId: string, kitId: string): Promise<KitDetailResult> {

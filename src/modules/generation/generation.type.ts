@@ -3,6 +3,7 @@ import type { RetrievalMode } from '@/modules/research/retrieval/retrieval.type'
 export type GenerationStage =
   | 'queued'
   | 'researching'
+  | 'analyzing-jd'
   | 'generating'
   | 'checking-coverage'
   | 'building-schedule'
@@ -33,6 +34,7 @@ export type GenerationInput = {
 export const GENERATION_STAGES: readonly GenerationStage[] = [
   'queued',
   'researching',
+  'analyzing-jd',
   'generating',
   'checking-coverage',
   'building-schedule',

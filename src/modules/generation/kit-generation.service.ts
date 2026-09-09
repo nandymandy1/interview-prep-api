@@ -160,7 +160,22 @@ export class KitGenerationService {
 
     const sequences = createInitialSequences();
 
-    await progress('researching', 'Extracting role requirements from the job description.');
+    // Research-first: company crawl + public discussion lookup run BEFORE any
+    // LLM call, generically (no roleHint). One research pass only.
+    await progress(
+      'researching',
+      'Crawling the company website and searching public interview discussions.',
+    );
+    const research = await this.dependencies.research.researchCompany({
+      companyUrl: input.companyUrl,
+      mode: input.mode,
+    });
+    const context = buildResearchContext(research);
+
+    // JD analysis second: requirements stay strictly JD-derived. Research
+    // data is used later only for brief/questions context, never to invent
+    // role requirements.
+    await progress('analyzing-jd', 'Extracting role requirements from the job description.');
     const extraction = await this.json(
       'You extract hiring signals from job descriptions. Return only JSON matching the requested shape.',
       `Extract the hiring signal from this job description (JD only; no external knowledge). ` +
@@ -168,7 +183,7 @@ export class KitGenerationService {
         `(technical = hard skills, behavioural = soft skills, domain = industry knowledge) and priority ` +
         `("must" = explicitly required, "nice" = bonus/preferred/nice-to-have). A thin JD yields thin ` +
         `requirements — possibly zero. Never invent technologies, years of experience, or criteria ` +
-        `absent from the text.\n\nReturn JSON: {"title": string, "seniority": string, "location": string|null, ` +
+        `absent from the text. Ignore company research evidence when deciding requirements.\n\nReturn JSON: {"title": string, "seniority": string, "location": string|null, ` +
         `"responsibilities": string[], "requirements": [{"text": string, "kind": "technical|behavioural|domain", ` +
         `"priority": "must|nice"}]}\n\nJOB DESCRIPTION:\n${input.jd}`,
       extractionSchema,
@@ -182,14 +197,6 @@ export class KitGenerationService {
       })),
       sequences,
     );
-
-    await progress('researching', 'Researching the company site and public discussions.');
-    const research = await this.dependencies.research.researchCompany({
-      companyUrl: input.companyUrl,
-      roleHint: extraction.title,
-      mode: input.mode,
-    });
-    const context = buildResearchContext(research);
 
     await progress('generating', 'Writing the company brief and flashcards.');
     const briefPack = await this.briefAndFlashcards(

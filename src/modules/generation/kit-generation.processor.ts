@@ -9,6 +9,8 @@ import {
 import type { KitGenerationService } from '@/modules/generation/kit-generation.service';
 import type { KitRepository } from '@/modules/kit/kit.repository';
 import type { GenerationJobData, GenerationStage } from '@/modules/generation/generation.type';
+import { OpenAiException } from '@/modules/generation/llm/openai.adapter';
+import { GeminiException } from '@/modules/generation/gemini.exception';
 
 export type GenerationJobRunnerDependencies = {
   kitRepository: Pick<KitRepository, 'updateGenerationState' | 'saveGeneratedKit'>;
@@ -45,7 +47,10 @@ export const runGenerationJob = async (
   };
 
   try {
-    await report('researching', 'Researching the company site and public discussions.');
+    await report(
+      'researching',
+      'Researching the company website and public interview discussions.',
+    );
     const { kit, sequences } = await generation.generate({
       jd,
       companyUrl,
@@ -64,15 +69,18 @@ export const runGenerationJob = async (
 
     logger.info('generation.job_completed', { kitId });
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Generation failed.';
+    // Provider adapters normalize to safe fixed messages, so their code and
+    // message persist verbatim. Anything else stays a generic failure — raw
+    // provider payloads never reach the browser.
+    const failure = failureOf(error);
     await kitRepository.updateGenerationState(userId, kitId, {
       status: 'failed',
-      stageMessage: message,
-      error: { code: 'GENERATION_FAILED', message },
+      stageMessage: failure.message,
+      error: { code: failure.code, message: failure.message },
     });
 
     try {
-      await publish({ kitId, stage: 'failed', message });
+      await publish({ kitId, stage: 'failed', message: failure.message });
     } catch {
       logger.warn('generation.progress_publish_failed', { kitId, stage: 'failed' });
     }
@@ -80,6 +88,15 @@ export const runGenerationJob = async (
     logger.error(error, 'generation.job_failed');
     throw error;
   }
+};
+
+const failureOf = (error: unknown): { code: string; message: string } => {
+  if (error instanceof OpenAiException || error instanceof GeminiException) {
+    return { code: error.code, message: error.message };
+  }
+
+  const message = error instanceof Error ? error.message : 'Generation failed.';
+  return { code: 'GENERATION_FAILED', message };
 };
 
 // BullMQ sandboxed processor: runs in a worker thread off the Express event

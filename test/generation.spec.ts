@@ -1,9 +1,10 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi, type Mock } from 'vitest';
 import { RequestContextService } from '@/common/context/request-context.service';
 import { createBaseLogger, LoggerService } from '@/infrastructure/logger/logger.service';
 import { validateFinalInterviewKit, validateInterviewKit } from '@/modules/kit/kit.validator';
 import { KitService } from '@/modules/kit/kit.service';
 import { KitGenerationService } from '@/modules/generation/kit-generation.service';
+import { OpenAiException } from '@/modules/generation/llm/openai.adapter';
 import { runGenerationJob } from '@/modules/generation/kit-generation.processor';
 import { runEvaluation } from '@/eval/evaluate';
 import { BraveSearchProvider } from '@/modules/research/search/brave-search.provider';
@@ -231,6 +232,140 @@ describe('kit generation pipeline', () => {
     expect(() => validateFinalInterviewKit(kit)).not.toThrow();
   });
 
+  it('reports stages in real execution order', async () => {
+    const { generation } = buildGeneration(true);
+    const stages: string[] = [];
+
+    await generation.generate({
+      ...generationInput(3),
+      onProgress: (stage) => {
+        stages.push(stage);
+      },
+    });
+
+    expect(stages).toEqual([
+      'researching',
+      'analyzing-jd',
+      'generating',
+      'generating',
+      'checking-coverage',
+      'building-schedule',
+    ]);
+  });
+
+  it('runs company research BEFORE llm requirement extraction', async () => {
+    const order: string[] = [];
+    const researchCompany = vi.fn(async () => {
+      order.push('research');
+      return fakeResearchResult();
+    });
+    const script = scriptGemini(true);
+    const generateJson = vi.fn(async (request: { systemPrompt: string; userPrompt: string }) => {
+      const prompt = `${request.systemPrompt}\n\n${request.userPrompt}`;
+
+      if (prompt.includes('Extract the hiring signal')) {
+        order.push('extraction');
+      }
+
+      return script.generateJson(request);
+    });
+    const generation = new KitGenerationService({
+      research: { researchCompany },
+      llm: { provider: 'openai', generateJson } as never,
+      logger: silentLogger(),
+    });
+
+    await generation.generate(generationInput(3));
+
+    expect(order).toEqual(['research', 'extraction']);
+    expect(researchCompany).toHaveBeenCalledWith(
+      expect.objectContaining({ companyUrl: 'https://acme.test', mode: 'evaluation' }),
+    );
+    // Generic research: no roleHint before JD extraction.
+    const firstResearchArg = (researchCompany.mock.calls as unknown[][])[0]?.[0] as Record<
+      string,
+      unknown
+    >;
+    expect(firstResearchArg).not.toHaveProperty('roleHint');
+  });
+
+  it('never calls LLM extraction when company research fails', async () => {
+    const researchCompany = vi.fn(async () => {
+      throw new Error('Crawl failed');
+    });
+    const generateJson = vi.fn(async () => extractionFixture);
+    const generation = new KitGenerationService({
+      research: { researchCompany },
+      llm: { provider: 'openai', generateJson } as never,
+      logger: silentLogger(),
+    });
+    const stages: string[] = [];
+
+    await expect(
+      generation.generate({
+        ...generationInput(3),
+        onProgress: (stage) => {
+          stages.push(stage);
+        },
+      }),
+    ).rejects.toThrow('Crawl failed');
+
+    expect(generateJson).not.toHaveBeenCalled();
+    expect(stages).toEqual(['researching']);
+  });
+
+  it('marks analyzing-jd failed when research succeeds but JD extraction fails', async () => {
+    const researchCompany = vi.fn(async () => fakeResearchResult());
+    const generateJson = vi.fn(async () => {
+      throw new OpenAiException(
+        'OPENAI_RATE_LIMITED',
+        'OpenAI is temporarily rate-limiting requests. Please retry in a moment.',
+        { status: 429 },
+      );
+    });
+    const generation = new KitGenerationService({
+      research: { researchCompany },
+      llm: { provider: 'openai', generateJson } as never,
+      logger: silentLogger(),
+    });
+    const stages: string[] = [];
+
+    await expect(
+      generation.generate({
+        ...generationInput(3),
+        onProgress: (stage) => {
+          stages.push(stage);
+        },
+      }),
+    ).rejects.toMatchObject({ code: 'OPENAI_RATE_LIMITED' });
+
+    expect(researchCompany).toHaveBeenCalledTimes(1);
+    expect(stages).toEqual(['researching', 'analyzing-jd']);
+  });
+
+  it('reports researching when company research fails', async () => {
+    const researchCompany = vi.fn(async () => {
+      throw new Error('Crawl failed');
+    });
+    const researchFailing = new KitGenerationService({
+      research: { researchCompany },
+      llm: { provider: 'gemini', generateJson: scriptGemini(true).generateJson } as never,
+      logger: silentLogger(),
+    });
+    const stages: string[] = [];
+
+    await expect(
+      researchFailing.generate({
+        ...generationInput(3),
+        onProgress: (stage) => {
+          stages.push(stage);
+        },
+      }),
+    ).rejects.toThrow('Crawl failed');
+
+    expect(stages).toEqual(['researching']);
+  });
+
   it('passes exact days through to the schedule (1 and 60)', async () => {
     const one = buildGeneration(true);
     const sixty = buildGeneration(true);
@@ -346,7 +481,9 @@ describe('generation job runner', () => {
   };
 
   const runnerDeps = (generate: ReturnType<typeof vi.fn>) => {
-    const updateGenerationState = vi.fn(async () => null);
+    const updateGenerationState: Mock<
+      (userId: string, kitId: string, update: Record<string, unknown>) => Promise<null>
+    > = vi.fn(async () => null);
     const saveGeneratedKit = vi.fn(async () => null);
     const published: Array<{ kitId: string; stage: string; message: string }> = [];
 
@@ -379,11 +516,11 @@ describe('generation job runner', () => {
     await runGenerationJob(jobData, deps);
 
     expect(saveGeneratedKit).toHaveBeenCalledWith('user-a', jobData.kitId, kit, sequences);
-    expect(updateGenerationState).toHaveBeenCalledWith(
-      'user-a',
-      jobData.kitId,
-      expect.objectContaining({ stage: 'researching' }),
-    );
+    expect(updateGenerationState).toHaveBeenNthCalledWith(1, 'user-a', jobData.kitId, {
+      status: 'running',
+      stage: 'researching',
+      stageMessage: 'Researching the company website and public interview discussions.',
+    });
     expect(published.map((event) => event.stage)).toEqual([
       'researching',
       'generating',
@@ -408,6 +545,63 @@ describe('generation job runner', () => {
       }),
     );
     expect(published.at(-1)).toMatchObject({ stage: 'failed' });
+  });
+
+  it('preserves the failed-at stage: failure write carries no stage', async () => {
+    const generate = vi.fn(async () => {
+      throw new OpenAiException(
+        'OPENAI_RATE_LIMITED',
+        'OpenAI is temporarily rate-limiting requests. Please retry in a moment.',
+        { status: 429 },
+      );
+    });
+    const { deps, updateGenerationState, saveGeneratedKit } = runnerDeps(generate);
+
+    await expect(runGenerationJob(jobData, deps)).rejects.toMatchObject({
+      code: 'OPENAI_RATE_LIMITED',
+    });
+    expect(saveGeneratedKit).not.toHaveBeenCalled();
+
+    const reportedStages = updateGenerationState.mock.calls.map(
+      (call) => (call[2] as unknown as { stage?: string }).stage,
+    );
+    expect(reportedStages).toEqual(['researching', undefined]);
+
+    // The failure write carries no stage: Mongo keeps the last active stage,
+    // so GET /status marks Researching company failed.
+    expect(updateGenerationState).toHaveBeenNthCalledWith(2, 'user-a', jobData.kitId, {
+      status: 'failed',
+      stageMessage: 'OpenAI is temporarily rate-limiting requests. Please retry in a moment.',
+      error: {
+        code: 'OPENAI_RATE_LIMITED',
+        message: 'OpenAI is temporarily rate-limiting requests. Please retry in a moment.',
+      },
+    });
+  });
+
+  it('persists provider-normalized failure codes and safe messages', async () => {
+    const generate = vi.fn(async () => {
+      throw new OpenAiException('OPENAI_CREDITS_EXHAUSTED', 'OpenAI billing quota was exhausted.', {
+        status: 429,
+      });
+    });
+    const { deps, updateGenerationState, saveGeneratedKit } = runnerDeps(generate);
+
+    await expect(runGenerationJob(jobData, deps)).rejects.toMatchObject({
+      code: 'OPENAI_CREDITS_EXHAUSTED',
+    });
+    expect(saveGeneratedKit).not.toHaveBeenCalled();
+    expect(updateGenerationState).toHaveBeenCalledWith(
+      'user-a',
+      jobData.kitId,
+      expect.objectContaining({
+        status: 'failed',
+        error: {
+          code: 'OPENAI_CREDITS_EXHAUSTED',
+          message: 'OpenAI billing quota was exhausted.',
+        },
+      }),
+    );
   });
 });
 

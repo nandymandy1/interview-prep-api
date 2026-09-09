@@ -63,6 +63,13 @@ export const createKitRouter = ({
     wrapRoute(kitController, 'getStatus', 'kit.getStatus'),
   );
 
+  router.post(
+    '/:kitId/retry',
+    [...idempotencyKeyValidator, ...kitIdParamValidator],
+    validationMiddleware,
+    wrapRoute(kitController, 'retry', 'kit.retry'),
+  );
+
   router.patch(
     '/:kitId/practice/:flashcardId',
     recordPracticeValidator,
