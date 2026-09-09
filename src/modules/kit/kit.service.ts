@@ -15,7 +15,11 @@ import type { GenerationJobData } from '@/modules/generation/generation.type';
 import type { KitGenerationService } from '@/modules/generation/kit-generation.service';
 import { buildResearchContext } from '@/modules/generation/research-context';
 import type { CompanyResearchService } from '@/modules/research/company-research.service';
-import { allocateFlashcardIds, allocateQuestionIds } from '@/modules/kit/kit-id.service';
+import {
+  allocateFlashcardIds,
+  allocateQuestionIds,
+  sequencesFromContent,
+} from '@/modules/kit/kit-id.service';
 import type { FlashcardDraft, QuestionDraft } from '@/modules/kit/kit-id.type';
 import type {
   AddFlashcardInput,
@@ -95,6 +99,30 @@ const docVersion = (doc: KitDocument): number | undefined => {
 };
 
 const idempotencyKeyPrefix = (key: string): string => key.slice(0, 8);
+
+// Mongoose nested subdocuments do not spread to plain objects (counters live
+// behind prototype getters), so `{ ...doc.idSequences }` yields undefined
+// values and every ID allocation throws. Pick the counters explicitly; kits
+// persisted without sequences fall back to the highest allocated IDs in the
+// stored content so builder additions never collide.
+const sequencesOf = (
+  doc: Pick<KitDocument, 'idSequences' | 'kit'>,
+): { requirement: number; question: number; flashcard: number } => {
+  const stored = doc.idSequences as unknown as
+    { requirement?: unknown; question?: unknown; flashcard?: unknown } | null | undefined;
+  const pick = (value: unknown): number | undefined =>
+    typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+  const requirement = pick(stored?.requirement);
+  const question = pick(stored?.question);
+  const flashcard = pick(stored?.flashcard);
+
+  if (requirement !== undefined && question !== undefined && flashcard !== undefined) {
+    return { requirement, question, flashcard };
+  }
+
+  const content = doc.kit as InterviewKit;
+  return sequencesFromContent(content.role.requirements, content.questions, content.flashcards);
+};
 
 export class KitService {
   constructor(private readonly dependencies: KitServiceDependencies) {}
@@ -650,7 +678,7 @@ export class KitService {
       const doc = await this.requireCompletedKit(userId, kitId);
       const content = structuredClone(doc.kit as InterviewKit);
       const meta: EditorMeta = structuredClone(doc.editorMeta ?? {});
-      const sequences = { ...doc.idSequences };
+      const sequences = sequencesOf(doc);
 
       if (input.section === 'schedule') {
         // No LLM: deterministic schedule over the current questions.
@@ -843,7 +871,7 @@ export class KitService {
     const doc = await this.requireCompletedKit(userId, kitId);
     const content = structuredClone(doc.kit as InterviewKit);
     const meta: EditorMeta = structuredClone(doc.editorMeta ?? {});
-    const sequences = { ...doc.idSequences };
+    const sequences = sequencesOf(doc);
 
     const nextMeta = apply(content, meta, sequences);
     const validated = this.dependencies.kitGeneration().validateEditedKit(content);

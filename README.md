@@ -1,261 +1,372 @@
-# Interview Prep API — Express + TypeScript Foundation
+# AI Interview Prep Kit
 
-A production-minded Express.js starter for the interview-prep assessment. It keeps Express explicit while borrowing the useful discipline of NestJS: constructor injection, clear layers, typed request validation, centralized exception handling, and an application composition root.
+Backend API + generation pipeline for the AI Interview Prep Kit
+(Trao Full-Stack Engineering Assessment).
 
-## Stack
+## Submission
 
-- Express.js 5
-- TypeScript (strict)
-- express-validator
-- Mongoose / MongoDB
-- Redis (ioredis via `REDIS_URL` only)
-- express-session + minimal ioredis-backed session store
-- Pino structured logging
+Live application:
+https://idacs-hpw9wbb0i-nandymandy1s-projects.vercel.app/
+
+Backend API:
+https://nandy1.i-dacs.com
+
+Frontend source:
+https://github.com/nandymandy1/interview-prep-web
+
+Backend source (this repository — primary submission, runs the mandatory evaluator):
+https://github.com/nandymandy1/interview-prep-api
+
+Walkthrough video:
+[To be added before submission]
+
+If the submission form accepts multiple repository links, submit BOTH. If it
+accepts only one GitHub URL, use this backend repository: the mandatory
+`npm run evaluate` entry point lives here.
+
+## Overview
+
+Paste a job description + company URL + days of preparation, and get back a
+generated interview preparation kit:
+
+JD + company URL + days
+→ company research
+→ JD requirement extraction (requirements come ONLY from the pasted JD)
+→ company brief, flashcards, and per-category interview questions
+→ deterministic coverage check (+ one targeted repair pass)
+→ deterministic exact-day study schedule
+→ editable builder (questions, brief, flashcards, schedule)
+→ flashcard practice with confidence tracking
+
+## Tech Stack
+
+Backend:
+
+- Node.js (>= 22), Express 5, TypeScript (strict)
+- MongoDB / Mongoose (kit + status persistence)
+- Redis / ioredis (sessions, BullMQ, rate-limit gate)
+- BullMQ (generation queue + worker thread)
+- Axios (retrieval + provider HTTP), Cheerio (page extraction)
+- Brave Search (public interview-discussion research)
+- OpenAI / Gemini adapters behind one `LlmGenerationAdapter` contract
+- Zod (provider + canonical-kit validation), express-validator (HTTP validation)
 - Vitest + Supertest
 
-## Core architecture
+Frontend (separate repository):
+
+- Next.js 16.3, React 19, Tailwind CSS v4, shadcn-style UI
+- TanStack Query (server state), Zustand (client state), Axios (HTTP only)
+
+## Architecture
 
 ```text
-HTTP request
-  -> request context + lifecycle logger
-  -> auth / validation middleware
-  -> wrapRoute(...)
-       -> lazy singleton controller provider resolves on first use
-       -> controller
-       -> service
-       -> repository / integration
-  -> response
+Browser
+  ↓  same-origin /api rewrite (cookies stay first-party)
+Next.js frontend (Vercel container)
+  ↓  proxy to Express origin
+Express API
+  ├─ MongoDB            ← kit + generation status (source of truth)
+  ├─ Redis / BullMQ     ← generation queue, sessions, Pub/Sub (best-effort)
+  ↓
+Generation worker (worker thread, same deployment)
+  ├─ company-site crawler
+  ├─ public interview-discussion research
+  ├─ LLM (OpenAI or Gemini, configured)
+  ├─ deterministic coverage check + repair
+  └─ deterministic schedule builder
 ```
 
-Construction is centralized in `src/container/app-container.ts`.
+Request flow inside the API: request context + lifecycle logger → auth /
+validation middleware → `wrapRoute(...)` (lazy singleton controller provider
+resolves on first use) → controller → service → repository. Construction is
+centralized in `src/container/app-container.ts`; a service never imports the
+container — dependencies arrive through explicit constructor objects.
 
-Application classes are provided through lazy singleton providers. A controller is not constructed when a route is registered; `wrapRoute` resolves the provider only when the route is actually executed.
+`GET /api/kits/:kitId/status` reads Mongo. Redis Pub/Sub progress
+(`kit-generation-progress`) is best-effort only: a dropped message never
+corrupts status.
 
-### Hard dependency rule
+## Research and generation sequence
 
-`new Service(...)`, `new Repository(...)`, and `new Controller(...)` belong in the application container only. A service must never import the container. Dependencies are explicit through constructor dependency objects.
+The actual pipeline order (do not rely on any other description):
 
-```ts
-new AuthService({
-  userRepository: userRepository(),
-  passwordService: passwordService(),
-  logger: loggerService(),
-});
-```
+1. Company-site research (bounded crawl from the homepage, discovered and
+   ranked links — never a fixed `/careers` guess)
+2. Public interview/hiring discussion research (Brave Search, bounded queries)
+3. JD-only requirement extraction (OpenAI; IDs allocated in code)
+4. Company brief + flashcards (one call; flashcards reference ONLY listed
+   `id [priority][kind]: text` mappings)
+5. Question generation by category: technical, behavioural, system-design,
+   company-fit (four separate calls; skipped entirely when zero requirements)
+6. Deterministic coverage check (code compares question `requirement_ids`
+   against requirement IDs — never model-decided)
+7. Exactly one targeted repair pass for uncovered must-have requirements
+8. Deterministic exact-day schedule
+9. Canonical Zod validation + persistence
 
-This means any service can reuse another service without becoming a service locator: add the dependency to the service's constructor type and wire it in the container.
+Requirements come only from the pasted JD. Company research informs the brief
+and company-fit questions; it must never invent role requirements. Progress
+stages: `queued → researching → analyzing-jd → generating → checking-coverage
+→ building-schedule → completed`, persisted per stage — a failure keeps its
+failed-at stage and the kit stays retryable via `POST /api/kits/:kitId/retry`
+(same kit, same inputs, exactly one active job).
 
-## Router pattern
+## Retrieval
 
-```ts
-router.post(
-  '/login',
-  loginValidator,
-  validationMiddleware,
-  wrapRoute(authController, 'login', 'auth.login'),
-);
-```
+- Company homepage crawl with discovered/ranked link following (bounded depth
+  and page budget), robots.txt respected
+- Hardened HTTP client: SSRF DNS binding, loopback/private ranges blocked in
+  production, `proxy: false`, 15 s total deadline, redirect-scope guards,
+  content-type and size limits, Cheerio text extraction
+- Failed or skipped sources are reported per branch, never fabricated; one
+  failed branch never destroys the other (research status:
+  `complete | partial | failed`)
+- Public discussion lookup: ≤3 sequential Brave queries, shared 600 ms start
+  gate (Redis `SET NX PX` across API/worker, in-process gate in the evaluator),
+  2 attempts with 429/backoff respected; absent key degrades to a structured
+  unavailable result
+- Research cache: 24 h by canonical URL + version + mode, company-generic
+  (same company + different JD = research HIT, full generation MISS)
+- All fetched text and the JD are treated as untrusted DATA inside prompts
+  (never instructions); extracted content is marked `external-untrusted`
 
-`authController` is a `Provider<AuthController>`, not an already-created controller.
+## LLM Provider
 
-## Exceptions
+Submitted production provider:
 
-Throw typed HTTP exceptions from controllers/services/repositories:
+Provider:
+OpenAI
 
-```ts
-throw new BadRequestException('Your error message goes here');
-```
+Model:
+gpt-5.6-terra
 
-Common exception classes are in `src/common/errors/http-exception.ts`.
+Generation runs through the configured `LlmGenerationAdapter` (OpenAI chat
+completions + `response_format: { type: "json_object" }`, or Gemini with
+`responseMimeType: application/json`). Selection: `LLM_PROVIDER=openai|gemini`,
+or auto-detect when exactly one key+model pair is configured.
 
-For expected exceptions, the client gets the original message and correct status code:
+- Bounded transient retries on the same provider: 429 (genuine rate limit),
+  500/502/503/504, transient network errors — max 3 attempts, exponential
+  backoff + jitter, `Retry-After` honored
+- Never retried: 400/401/403, quota/billing exhaustion, invalid responses
+- No automatic OpenAI→Gemini runtime fallback: a provider failure stays a
+  provider failure, then the kit fails with a safe message
+- Every provider JSON response is Zod-validated before use; API keys,
+  Authorization headers, prompts, and JDs are never logged
+- Whole-generation BullMQ job uses `attempts = 1` (provider/retrieval layers
+  already bound their retries)
 
-```json
-{
-  "success": false,
-  "message": "Your error message goes here"
-}
-```
+NEVER expose API keys. The repository ships with no provider/model configured;
+production values live in deployment environment variables only.
 
-Validation errors may additionally include `details`.
+## Coverage / Second Pass
 
-Unknown/internal errors are logged with the request context but return a generic `Internal server error` message so internal details are not leaked.
+Coverage is code-driven, not model-decided. After question generation,
+`calculateCoverage` compares every question's `requirement_ids` against the
+requirement IDs. Any uncovered must-have triggers exactly one targeted repair
+call (uncovered requirements only), then coverage runs again. A kit whose
+must-haves still lack coverage fails instead of shipping uncovered
+(`coverage: { uncovered_requirement_ids: [], passes }` on success).
 
-`wrapRoute` logs route failures itself and writes the error response. Errors raised before a wrapped route runs (for example auth/validation/404 middleware) are handled by the global error middleware using the exact same response formatter.
+## Schedule
 
-## Request logging
+The schedule is deterministic: exactly the requested N days (1–60), integer
+30-minute blocks per question, must-have material prioritized earlier, and
+every scheduled `question_ids` entry references a real question. Thin kits
+(zero requirements) still get the exact day count with honest empty days
+(`Review available role and company context`, 0 minutes). Regenerating any
+section rebuilds the schedule from all final questions.
 
-Every request receives an `x-request-id`. `AsyncLocalStorage` keeps that request context available through controllers, services, repositories, and integrations without manually threading request IDs through every method.
+## Builder State
 
-Lifecycle logs include:
+`editorMeta` (question `pinned`/`edited`/`manual` flags, edited brief fields)
+lives outside the canonical kit JSON. Manually edited or added content survives
+category regeneration; regeneration replaces only untouched content, runs one
+targeted coverage-repair pass when a must loses coverage (an unrepairable
+regeneration fails WITHOUT saving), and continues high-water stable IDs
+(`q3`, `f2`, … never reused). Builder writes carry the read `__v`: a stale
+write is a structured 409 (`Kit changed; refreshing latest version.`), never a
+silent clobber. All mutating routes accept `Idempotency-Key` (one UUID per
+logical action; repeats replay instead of duplicating).
 
-- request id
-- user id when authenticated
-- HTTP method + path
-- route operation
-- status code
-- handler duration
-- total request duration
-- errors
+## Practice
 
-Sensitive headers/passwords are not deliberately logged. Never add secrets, raw session IDs, auth headers, or full passwords to log metadata.
+Completed kits only: one flashcard at a time, weakest-first ordering
+(unpractised → lowest confidence → original order; the deck reranks from
+refetched state after every record so no card is skipped). Each card reveals
+its answer, then records a 1–5 confidence score with SET semantics per
+flashcard (a repeated PATCH leaves one logical record). Covered/uncovered
+counts derive from recorded flashcards.
 
-## Local setup
+## Failure Handling
+
+- Invalid/unreachable company or missing hiring pages: research degrades to
+  honest `partial`/`failed` with per-branch failures; generation continues
+  whenever a valid kit is still possible
+- No public discussion results: partial research, brief says so honestly
+- Thin JD (no extractable criteria): honest thin kit — possibly zero
+  requirements/questions/flashcards, exact-day schedule, empty coverage
+- Provider rate limit: transient 429s retry with backoff; quota exhaustion
+  fails fast with a safe message; failed kits retry via the same kit ID
+- Invalid model JSON: schema validation rejects it; malformed envelopes fail
+  the job safely (never persisted as a kit)
+- Duplicate generation: `Idempotency-Key` + `jobId = kitId` guarantee one kit
+  and one active job per logical submission
+- 1-day and 60-day schedules are covered by tests (exact day counts)
+
+## Security
+
+- Session auth (Redis-backed store); every kit route is owner-scoped
+  (`findOwnedById` — no cross-user access)
+- SSRF-hardened retrieval: DNS rebinding protection, private/loopback ranges
+  blocked in production, redirect-scope + robots enforcement, content-type and
+  size caps
+- Fetched pages and pasted JDs are untrusted input, never instructions
+- Secrets come from the environment only; logs never carry keys, auth headers,
+  session IDs, passwords, prompts, or JDs
+- Unknown errors return generic `Internal server error`; validation errors
+  return structured details without internals
+
+## Local Setup
 
 ```bash
+git clone https://github.com/nandymandy1/interview-prep-api.git
+cd interview-prep-api
+
 cp .env.example .env
-npm install
-npm run dev
+npm ci
 ```
 
-Required local services:
+Required local infrastructure:
 
 - MongoDB
 - Redis
 
+Configure in `.env`: an LLM API key + model (`LLM_PROVIDER=openai` with
+`OPENAI_API_KEY`/`OPENAI_MODEL`, or the Gemini pair), and optionally
+`BRAVE_SEARCH_API_KEY` for discussion research.
+
 Then:
+
+```bash
+npm run dev
+```
+
+Health:
 
 ```bash
 curl http://localhost:4000/health
 ```
 
-## Useful commands
+The worker thread runs inside the same deployment from compiled output: use
+`npm run build && npm start` for generation (dev must build first or the
+worker refuses to start — the API never listens half-capable).
+
+## Batch evaluator
+
+The mandatory assessment entry point. Reuses the SAME `KitGenerationService`
+as the application, sequentially, continuing after individual failures.
+No auth, no BullMQ, no MongoDB, no Redis connection for core execution
+(placeholder infra values are never connected); localhost `company_url`
+values are allowed in evaluation mode. Real LLM credentials are required;
+without a Brave key, discussion research degrades to unavailable.
+
+Exact command:
 
 ```bash
-npm run dev
-npm run typecheck
-npm test
-npm run lint
-npm run build
-npm run check
+npm run evaluate -- --input <cases.json> --output <kits.json>
 ```
 
-## Included example feature
+Input:
 
-The `auth` module demonstrates the full pattern:
-
-```text
-auth.router.ts
-  -> auth.controller.ts
-  -> auth.service.ts
-  -> user.repository.ts
-  -> user.model.ts
+```json
+[
+  {
+    "id": "case-01",
+    "jd": "...",
+    "company_url": "http://localhost:8099/acme/",
+    "days": 5
+  }
+]
 ```
 
-Routes:
+Output shape:
 
-- `POST /api/auth/register`
-- `POST /api/auth/login`
-- `POST /api/auth/logout`
-- `GET /api/auth/me`
-
-Session data is stored in Redis.
-
-## Adding a new module
-
-For a `kit` module, prefer only the layers it actually needs:
-
-```text
-src/modules/kit/
-  kit.router.ts
-  kit.controller.ts
-  kit.service.ts
-  kit.repository.ts
-  kit.model.ts
-  kit.validator.ts
-  kit.type.ts
+```json
+{
+  "version": "1.0",
+  "generated_at": "...",
+  "kits": [
+    {
+      "id": "case-01",
+      "status": "ok",
+      "kit": {},
+      "error": null
+    }
+  ]
+}
 ```
 
-Do not create empty layers purely to satisfy a pattern.
+Failed cases report `"status": "failed"`, `"kit": null`, and an
+`{ code, message }` error object. Canonical kit fields (`source`,
+`company_brief`, `role`, `questions`, `flashcards`, `schedule`, `coverage`)
+are identical to the application output — do not rename them.
 
-Then add lazy providers to `app-container.ts`, add route dependency mapping in `router-dependencies.ts`, and register the router in `routes/index.ts`.
+## Deployment
 
-## Interview kit pipeline (assessment)
+- Backend: public Express deployment at `https://nandy1.i-dacs.com`
+  (API + BullMQ worker thread in one service; needs Node `worker_threads`,
+  MongoDB, Redis, provider keys via environment)
+- Frontend: Vercel Container (`Dockerfile.vercel`, Next.js standalone,
+  Node 22) at the live application URL above; `API_PROXY_TARGET` points at
+  the backend origin and is baked at frontend build time
+- Required backend environment: `NODE_ENV=production`,
+  `PORT` (deployment-supplied), `FRONTEND_ORIGIN` (production web URL),
+  `MONGODB_URI`, `REDIS_URL`, `SESSION_SECRET` (strong, 32+ chars),
+  `SESSION_COOKIE_NAME=interview_prep.sid`, `LOG_LEVEL=info`,
+  `BRAVE_SEARCH_API_KEY`, `LLM_PROVIDER=openai`, `OPENAI_API_KEY`,
+  `OPENAI_MODEL=gpt-5.6-terra`, `GENERATION_CACHE_TTL_DAYS=7`,
+  `RESEARCH_CACHE_TTL_HOURS=24`
+- No secrets in the repository — see `.env.example` for the documented shape
 
-Overview: paste a job description + company URL + days → `POST /api/kits` persists a
-queued kit and enqueues one BullMQ job → a worker thread researches, generates via
-Gemini, validates, repairs coverage, schedules, and persists → frontend polls
-`GET /api/kits/:kitId/status` → builder edits → flashcard practice.
+## Tests
 
-- Queue: one `kit-generation` BullMQ queue, `jobId = kitId` (never double-enqueue),
-  `attempts = 1`, worker `concurrency = 1`.
-- Worker thread: BullMQ `useWorkerThreads` with the external compiled processor
-  (`dist/modules/generation/kit-generation.processor.js`). Boot the API from `dist`
-  (`npm run build && npm start`); dev must build first or the worker refuses to start.
-  A worker that cannot start aborts boot — the API never listens half-capable.
-  Same deployment — no second service; needs Node `worker_threads` allowed.
-- Progress: Redis Pub/Sub channel `kit-generation-progress` is best-effort only
-  (publish failures log and continue). Mongo kit `status`/`stage` is the source of
-  truth for `GET /status`.
-- Redis: ioredis is the only client, configured by `REDIS_URL` alone (no host/port
-  split). Shared command connection + BullMQ connections (`maxRetriesPerRequest:
-null`) + dedicated subscriber duplicate.
-- Brave Search (2 req/s plan): every HTTP attempt passes a shared start gate
-  (`BRAVE_MIN_REQUEST_INTERVAL_MS = 600`, Redis `SET NX PX` across API/worker,
-  in-process gate in the evaluator), ≤3 sequential queries, 2 attempts, 429/backoff
-  respected. Absent key → structured unavailable, never fabricated.
-- LLM: one `LlmGenerationAdapter` contract with two providers — OpenAI
-  (`OPENAI_API_KEY`/`OPENAI_MODEL`, chat completions + `response_format json_object`)
-  and Gemini (`GEMINI_API_KEY`/`GEMINI_MODEL`, `responseMimeType application/json`).
-  Selection: `LLM_PROVIDER=openai|gemini`, or auto-detect when exactly one pair is
-  configured; both pairs without `LLM_PROVIDER`, or none, is a config error. No
-  runtime fallback: a provider failure retries that provider with bounded
-  exponential backoff + jitter (max 3 attempts, Retry-After honored) then fails
-  gracefully. 401/403 normalize to `LLM_AUTH_INVALID` and are never retried.
-  Keys never logged. No provider/model is configured in this repo by
-  default — set them in `.env` (never commit).
-- Retrieval: Axios-only hardened client (SSRF DNS binding, `proxy: false`, 15s total
-  deadline, redirect scope/robots guards, robots.txt respected, Cheerio extraction,
-  content marked `external-untrusted`, prompts treat JD/research as data).
-- Generation sequence: company research first (cached 24h by canonical URL + version + mode,
-  generic — no role hint) → JD-only requirement extraction (IDs in code) → brief + flashcards (one call,
-  flashcards reference ONLY listed `id [priority][kind]: text` mappings) → four
-  separate category calls (skipped entirely when zero requirements) →
-  deterministic coverage + exactly one repair pass (final uncovered MUST is `[]`) →
-  deterministic schedule for the exact day count → canonical validation.
-- Exact-input cache: identical normalized JD + canonical company URL reuses pristine
-  generated material (fingerprint `sha256(GENERATION_VERSION + URL + JD)`, 7-day TTL,
-  days excluded) with zero research/LLM calls; the schedule rebuilds for the current
-  days, editor/practice state starts clean, and invalid content is a miss. Same
-  company + different JD is a full-generation miss (research cache may still hit).
-- Idempotency: mutating routes accept `Idempotency-Key` (one UUID per logical action,
-  reused across retries). Same create key → the original `{kitId, status}`, one Kit,
-  one BullMQ job (`jobId = kitId` is the second protection). Same regen/add key →
-  current kit, no second LLM call or duplicate question/flashcard.
-- Optimistic concurrency: builder writes carry the read `__v`; a stale write is a
-  structured 409 (`Kit changed; refreshing latest version.`), never a silent clobber.
-  `__v` never enters the canonical kit JSON.
-- Thin JD: a JD with no extractable criteria yields an honest kit — possibly zero
-  requirements/questions/flashcards, exact-day schedule with empty days (`Review
-available role and company context`, 0 minutes), coverage `{uncovered: [], passes:
-1}`. Nothing is invented to fill it.
-- Editor preservation: `pinned`/`edited`/`manual` question flags and edited brief fields
-  live in `editorMeta` outside the strict canonical kit; regeneration replaces only
-  unedited content, runs one targeted coverage-repair pass when a must loses coverage
-  (an unrepairable regen fails WITHOUT saving, kit untouched), rebuilds the schedule
-  from all final questions, and reuses high-water IDs. Manual questions may reference
-  zero requirements.
-- Practice: completed kits only; weakest-first (unpractised → lowest confidence →
-  original order, position resets after each record so no card is skipped);
-  confidence is SET semantics per flashcard (a repeated PATCH leaves one logical
-  record). Builder deletes are retry-friendly (re-deleting returns the current kit);
-  the final question may be deleted for an honest empty kit.
-- Evaluator (no Mongo/BullMQ/auth): `npm run evaluate -- --input <cases.json>
---output <kits.json>` reuses the same service sequentially (`mode = evaluation`,
-  localhost company URLs allowed) and writes `{version: "1.0", generated_at, kits:
-[{id, status, kit, error}]}` with `error: null` on success. Input cases use
-  `company_url` (not `companyUrl`).
+```bash
+npm ci
+npm run check     # typecheck + tests + lint + format:check + build
+```
 
-Env: `PORT, FRONTEND_ORIGIN, MONGODB_URI, REDIS_URL, SESSION_SECRET,
-BRAVE_SEARCH_API_KEY (optional), LLM_PROVIDER, OPENAI_API_KEY, OPENAI_MODEL,
-GEMINI_API_KEY, GEMINI_MODEL, GENERATION_CACHE_TTL_DAYS (default 7),
-RESEARCH_CACHE_TTL_HOURS (default 24)`.
+Focused suites: `test/generation.spec.ts` (pipeline order, thin JD, cache,
+retry preservation), `test/builder.spec.ts` (preservation, concurrency,
+sequence hydration), `test/kit-api.spec.ts` + `test/kit-retry.spec.ts` (HTTP
+contracts, idempotency), `test/llm-adapter.spec.ts` (retry policy,
+classification, request compatibility), `test/*research*.spec.ts`,
+`test/crawl.spec.ts` (retrieval, robots, gates).
 
-Submitted provider/model: none configured in this repo by default (set in `.env`,
-never commit). Generation is performed through the configured LLM adapter
-(OpenAI or Gemini). Production configuration can select OpenAI.
+## Known Limitations
 
-Known limitations: regeneration re-runs live research on a research-cache miss
-(costs Brave quota per click); single worker means one kit generates at a time;
-Pub/Sub progress can drop messages (`GET /status` stays correct); generation and
-live evaluator runs require real LLM credentials.
+- One generation worker (`concurrency = 1`) favors provider/quota safety over
+  throughput: one kit generates at a time
+- Live generation depends on third-party LLM/research availability
+- Pub/Sub progress is best-effort; Mongo status is authoritative
+- Company research cache may temporarily return recent cached research
+- Regeneration re-runs live research on a research-cache miss (costs Brave
+  quota per click)
+- Evaluator and live generation runs require real provider credentials
+
+## Submission Links
+
+Application:
+https://idacs-hpw9wbb0i-nandymandy1s-projects.vercel.app/
+
+Backend API:
+https://nandy1.i-dacs.com
+
+Backend / evaluator repository:
+https://github.com/nandymandy1/interview-prep-api
+
+Frontend repository:
+https://github.com/nandymandy1/interview-prep-web
+
+Walkthrough video:
+[To be added before submission]

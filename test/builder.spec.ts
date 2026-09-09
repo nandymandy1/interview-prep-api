@@ -301,6 +301,78 @@ describe('builder mutation integrity', () => {
   });
 });
 
+describe('sequence hydration from Mongo documents', () => {
+  // Faithful to Mongoose: subdocument counters live behind prototype getters,
+  // so a naive `{ ...doc.idSequences }` spread loses them and every builder
+  // ID allocation threw `Kit ID sequences must be non-negative integers`.
+  class SubdocumentSequences {
+    get requirement(): number {
+      return 2;
+    }
+
+    get question(): number {
+      return 2;
+    }
+
+    get flashcard(): number {
+      return 1;
+    }
+  }
+
+  const hydratedService = (idSequences: unknown) => {
+    let current = regenKit();
+    const service = new KitService({
+      kitRepository: {
+        findOwnedById: vi.fn(async () => ({
+          id: 'kit',
+          status: 'completed',
+          input: { jd: 'Build things', companyUrl: 'https://acme.test', days: 1 },
+          kit: structuredClone(current),
+          idSequences,
+          editorMeta: {},
+          practiceRecords: [],
+        })),
+        saveEditedKit: vi.fn(async (_u: string, _k: string, kit: InterviewKit) => {
+          current = structuredClone(kit);
+          return { kit: current };
+        }),
+      } as never,
+      idempotency: freshNoIdempotency() as never,
+      generationQueue: {} as never,
+      kitGeneration: (() => ({ validateEditedKit: validateInterviewKit })) as never,
+      research: {} as never,
+      logger: silentLogger(),
+    });
+
+    return service;
+  };
+
+  const addInput = {
+    prompt: 'New question',
+    answer_outline: 'New outline',
+    category: 'technical' as const,
+    requirement_ids: ['r1'],
+  };
+
+  it('allocates the next stable ID from subdocument-shaped sequences', async () => {
+    expect({ ...(new SubdocumentSequences() as unknown as Record<string, unknown>) }).toEqual({});
+
+    const updated = await hydratedService(new SubdocumentSequences()).addQuestion(
+      'user-a',
+      'kit',
+      addInput,
+    );
+
+    expect(updated.questions.map((question) => question.id)).toContain('q3');
+  });
+
+  it('derives sequences from persisted content when sequences are absent', async () => {
+    const updated = await hydratedService(undefined).addQuestion('user-a', 'kit', addInput);
+
+    expect(updated.questions.map((question) => question.id)).toContain('q3');
+  });
+});
+
 describe('practice SET semantics', () => {
   // Minimal fake honoring just the two filter shapes the repository uses:
   // positional update by flashcardId, or guarded push when absent.
