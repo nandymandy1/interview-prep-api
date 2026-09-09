@@ -6,7 +6,7 @@ Backend API + generation pipeline for the AI Interview Prep Kit
 ## Submission
 
 Live application:
-https://idacs-hpw9wbb0i-nandymandy1s-projects.vercel.app/
+https://interview-prep-web-delta.vercel.app
 
 Backend API:
 https://nandy1.i-dacs.com
@@ -357,7 +357,7 @@ classification, request compatibility), `test/*research*.spec.ts`,
 ## Submission Links
 
 Application:
-https://idacs-hpw9wbb0i-nandymandy1s-projects.vercel.app/
+https://interview-prep-web-delta.vercel.app
 
 Backend API:
 https://nandy1.i-dacs.com
