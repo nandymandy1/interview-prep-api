@@ -19,6 +19,8 @@ export type AppConfig = {
   openaiModel?: string;
   geminiApiKey?: string;
   geminiModel?: string;
+  generationCacheTtlDays: number;
+  researchCacheTtlHours: number;
 };
 
 const required = (name: string): string => {
@@ -76,7 +78,23 @@ export const loadAppConfig = (): AppConfig => {
     llmProvider: parseLlmProvider(process.env.LLM_PROVIDER),
     openaiApiKey: process.env.OPENAI_API_KEY?.trim() || undefined,
     openaiModel: process.env.OPENAI_MODEL?.trim() || undefined,
+    generationCacheTtlDays: parsePositiveInt(process.env.GENERATION_CACHE_TTL_DAYS, 7),
+    researchCacheTtlHours: parsePositiveInt(process.env.RESEARCH_CACHE_TTL_HOURS, 24),
   };
+};
+
+const parsePositiveInt = (value: string | undefined, fallback: number): number => {
+  if (value === undefined || !value.trim()) {
+    return fallback;
+  }
+
+  const parsed = Number(value);
+
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    throw new Error('Cache TTL values must be positive integers when set.');
+  }
+
+  return parsed;
 };
 
 const parseLlmProvider = (value: string | undefined): LlmProviderName | undefined => {

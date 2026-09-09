@@ -34,6 +34,34 @@ export const createInitialSequences = (): KitIdSequences => ({
   flashcard: 0,
 });
 
+// Cache-hit kits reuse pristine IDs verbatim; the sequences resume from the
+// highest allocated index so later builder additions never collide.
+export const sequencesFromContent = (
+  requirements: readonly { id: string }[],
+  questions: readonly { id: string }[],
+  flashcards: readonly { id: string }[],
+): KitIdSequences => {
+  const maxIndex = (items: readonly { id: string }[], prefix: StableIdPrefix): number => {
+    let max = 0;
+
+    for (const item of items) {
+      const match = new RegExp(`^${prefix}(\\d+)$`).exec(item.id);
+
+      if (match) {
+        max = Math.max(max, Number(match[1]));
+      }
+    }
+
+    return max;
+  };
+
+  return {
+    requirement: maxIndex(requirements, 'r'),
+    question: maxIndex(questions, 'q'),
+    flashcard: maxIndex(flashcards, 'f'),
+  };
+};
+
 export const allocateStableId = (sequences: KitIdSequences, prefix: StableIdPrefix): string => {
   assertValidSequences(sequences);
   const key = sequenceKey[prefix];

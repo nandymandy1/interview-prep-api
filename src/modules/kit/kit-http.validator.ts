@@ -1,5 +1,14 @@
-import { body, param, query } from 'express-validator';
+import { body, header, param, query } from 'express-validator';
 import { MAX_PAGE_LIMIT } from '@/common/types/pagination.type';
+
+export const idempotencyKeyValidator = [
+  header('Idempotency-Key')
+    .optional()
+    .isString()
+    .trim()
+    .isLength({ min: 1, max: 128 })
+    .withMessage('Idempotency-Key must be a non-empty string up to 128 characters'),
+];
 
 export const listKitsValidator = [
   query('page').optional().isInt({ min: 1 }).withMessage('Page must be an integer >= 1').toInt(),
@@ -96,7 +105,9 @@ export const addQuestionValidator = [
 
 export const reorderQuestionsValidator = [
   ...kitIdParamValidator,
-  body('questionIds').isArray({ min: 1 }).withMessage('Question IDs must be a non-empty array'),
+  // Empty arrays are legal: an honestly thin kit may hold zero questions, and
+  // the service still requires the payload to list every question exactly once.
+  body('questionIds').isArray().withMessage('Question IDs must be an array'),
 ];
 
 export const deleteQuestionValidator = [...kitIdParamValidator, ...questionIdParamValidator];

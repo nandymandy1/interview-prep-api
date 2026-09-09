@@ -7,6 +7,11 @@ import { companyNameHintFromCrawl } from '@/modules/research/company-research.se
 import type { CompanyResearchResult } from '@/modules/research/company-research.service';
 import type { LlmGenerationAdapter } from '@/modules/generation/llm/llm-adapter';
 import { buildResearchContext, type ResearchContext } from '@/modules/generation/research-context';
+import {
+  generationFingerprint,
+  type GenerationCacheStore,
+  type PristineGeneratedContent,
+} from '@/modules/generation/generation-fingerprint';
 import type {
   GenerationInput,
   GenerationProgressCallback,
@@ -17,6 +22,7 @@ import {
   allocateQuestionIds,
   allocateRequirementIds,
   createInitialSequences,
+  sequencesFromContent,
 } from '@/modules/kit/kit-id.service';
 import type {
   FlashcardDraft,
@@ -42,6 +48,9 @@ type KitGenerationDependencies = {
   research: Pick<CompanyResearchService, 'researchCompany'>;
   llm: LlmGenerationAdapter;
   logger: LoggerService;
+  // Optional exact-input cache seam. The worker path passes a Mongo-backed
+  // store; the evaluator CLI passes none, keeping its path direct.
+  cache?: GenerationCacheStore;
 };
 
 const MAX_REQUIREMENTS = 30;
@@ -124,8 +133,32 @@ export class KitGenerationService {
 
   async generate(input: GenerationInput): Promise<GeneratedKit> {
     const { logger } = this.dependencies;
-    const sequences = createInitialSequences();
     const progress = this.progressOf(input.onProgress);
+
+    // Exact-input reuse: a fresh hit skips research AND every LLM call. The
+    // schedule is rebuilt for the CURRENT requested days; editor metadata and
+    // practice state start clean in the caller, never from the cache.
+    const fingerprint = generationFingerprint(input.jd, input.companyUrl);
+    const cached = await this.findFreshCache(fingerprint);
+
+    if (cached) {
+      const hit = this.assembleFromCache(input, cached.content);
+
+      if (hit) {
+        await progress('building-schedule', 'Reusing recent generation for identical input.');
+        logger.info('generation.cache_hit', {
+          fingerprintPrefix: fingerprint.slice(0, 12),
+          days: input.days,
+        });
+        return hit;
+      }
+
+      logger.warn('generation.cache_invalid', { fingerprintPrefix: fingerprint.slice(0, 12) });
+    } else {
+      logger.info('generation.cache_miss', { fingerprintPrefix: fingerprint.slice(0, 12) });
+    }
+
+    const sequences = createInitialSequences();
 
     await progress('researching', 'Extracting role requirements from the job description.');
     const extraction = await this.json(
@@ -159,7 +192,12 @@ export class KitGenerationService {
     const context = buildResearchContext(research);
 
     await progress('generating', 'Writing the company brief and flashcards.');
-    const briefPack = await this.briefAndFlashcards(extraction.title, requirements, context);
+    const briefPack = await this.briefAndFlashcards(
+      extraction.title,
+      requirements,
+      context,
+      requirements.length === 0,
+    );
     const flashcards = allocateFlashcardIds(
       briefPack.flashcards.slice(0, MAX_FLASHCARDS),
       sequences,
@@ -168,20 +206,24 @@ export class KitGenerationService {
     await progress('generating', 'Writing interview questions per category.');
     const questions: KitQuestion[] = [];
 
-    for (const category of QUESTION_CATEGORIES) {
-      const drafts = await this.categoryQuestions(
-        category,
-        extraction.title,
-        requirements,
-        context,
-        questions,
-      );
-      questions.push(
-        ...allocateQuestionIds(
-          drafts.map((draft) => ({ ...draft, category })),
-          sequences,
-        ),
-      );
+    // Thin JD honesty: zero requirements means zero questions. The four
+    // category calls are skipped entirely — no generic filler to look full.
+    if (requirements.length > 0) {
+      for (const category of QUESTION_CATEGORIES) {
+        const drafts = await this.categoryQuestions(
+          category,
+          extraction.title,
+          requirements,
+          context,
+          questions,
+        );
+        questions.push(
+          ...allocateQuestionIds(
+            drafts.map((draft) => ({ ...draft, category })),
+            sequences,
+          ),
+        );
+      }
     }
 
     await progress('checking-coverage', 'Checking must-have requirement coverage.');
@@ -228,6 +270,39 @@ export class KitGenerationService {
       coverage: { uncovered_requirement_ids: [], passes },
     });
 
+    // Cache the pristine material for identical future inputs. Best-effort: a
+    // cache write failure must never fail an otherwise successful generation.
+    try {
+      await this.dependencies.cache?.upsert({
+        fingerprint,
+        jd: input.jd,
+        companyUrl: input.companyUrl,
+        content: {
+          companyBrief: {
+            summary: kit.company_brief.summary,
+            what_they_do: kit.company_brief.what_they_do,
+            sources: kit.company_brief.sources,
+          },
+          role: kit.role,
+          questions: kit.questions,
+          flashcards: kit.flashcards,
+          coverage: kit.coverage,
+          sourceFacts: {
+            company: kit.source.company,
+            companyUrl: kit.source.company_url,
+            role: kit.source.role,
+            location: kit.source.location,
+            jdChars: kit.source.jd_chars,
+            pagesUsed: kit.source.pages_used,
+          },
+        },
+      });
+    } catch {
+      logger.warn('generation.cache_store_failed', {
+        fingerprintPrefix: fingerprint.slice(0, 12),
+      });
+    }
+
     logger.info('generation.completed', {
       requirements: requirements.length,
       questions: questions.length,
@@ -257,11 +332,93 @@ export class KitGenerationService {
     requirements: readonly KitRequirement[],
     context: ResearchContext,
   ): Promise<Array<Omit<QuestionDraft, 'category'>>> {
+    // Thin-kit honesty applies to regeneration too: with zero requirements
+    // there is nothing to ground questions on, so return none.
+    if (requirements.length === 0) {
+      return [];
+    }
+
     return this.categoryQuestions(category, roleTitle, requirements, context, []);
+  }
+
+  // Single targeted repair entry point for category regeneration: the caller
+  // merges, re-runs coverage, and rebuilds the schedule itself.
+  async repairQuestions(
+    requirements: readonly KitRequirement[],
+    questions: readonly KitQuestion[],
+    context: ResearchContext,
+  ): Promise<QuestionDraft[]> {
+    return this.repairCoverage(requirements, questions, context);
   }
 
   validateEditedKit(value: unknown): InterviewKit {
     return validateInterviewKit(value);
+  }
+
+  // Best-effort lookup: a cache failure never fails generation, it just
+  // degrades to a miss.
+  private async findFreshCache(
+    fingerprint: string,
+  ): Promise<{ content: PristineGeneratedContent } | null> {
+    if (!this.dependencies.cache) {
+      return null;
+    }
+
+    try {
+      return await this.dependencies.cache.findFresh(fingerprint);
+    } catch {
+      this.dependencies.logger.warn('generation.cache_lookup_failed', {
+        fingerprintPrefix: fingerprint.slice(0, 12),
+      });
+      return null;
+    }
+  }
+
+  // Rebuilds a full valid kit from pristine cached material WITHOUT new
+  // research or LLM calls. The schedule uses the CURRENT requested days;
+  // source.researched_at is rebuilt truthfully (now) while provenance
+  // (company, pages_used) is preserved, never fabricated. Returns null when
+  // the cached material no longer validates → caller treats it as a miss.
+  private assembleFromCache(
+    input: GenerationInput,
+    content: PristineGeneratedContent,
+  ): GeneratedKit | null {
+    try {
+      const prepared = prepareSchedule({
+        requirements: content.role.requirements,
+        questions: content.questions,
+        daysAvailable: input.days,
+      });
+
+      const kit = validateFinalInterviewKit({
+        source: {
+          company: content.sourceFacts.company,
+          company_url: input.companyUrl,
+          role: content.sourceFacts.role,
+          location: content.sourceFacts.location,
+          jd_chars: input.jd.length,
+          researched_at: new Date().toISOString(),
+          pages_used: content.sourceFacts.pagesUsed,
+        },
+        company_brief: {
+          summary: content.companyBrief.summary,
+          what_they_do: content.companyBrief.what_they_do,
+          sources: content.companyBrief.sources,
+        },
+        role: content.role,
+        questions: content.questions,
+        flashcards: content.flashcards,
+        schedule: { days_available: input.days, days: prepared.schedule.days },
+        coverage: content.coverage,
+      });
+
+      return {
+        kit,
+        sequences: sequencesFromContent(kit.role.requirements, kit.questions, kit.flashcards),
+      };
+    } catch {
+      return null;
+    }
   }
 
   private async json<T>(
@@ -282,12 +439,23 @@ export class KitGenerationService {
     briefOnly = false,
   ): Promise<{ brief: { summary: string; what_they_do: string }; flashcards: FlashcardDraft[] }> {
     const validIds = new Set(requirements.map((requirement) => requirement.id));
+    // Flashcards may reference ONLY provided requirement IDs, so the model
+    // gets the actual id → priority/kind/text mapping, never bare ids.
+    const requirementGuide =
+      requirements
+        .map(
+          (requirement) =>
+            `${requirement.id} [${requirement.priority}][${requirement.kind}]: ${requirement.text}`,
+        )
+        .join('\n') || '(none — leave requirement_ids empty)';
     const pack = await this.json(
       `You write company briefs and study flashcards for candidates. Return only JSON matching the requested shape.`,
       `For a "${roleTitle}" candidate, write a short company brief from the evidence ` +
         `(${briefOnly ? 'brief only' : 'brief plus study flashcards linked to requirement IDs'}). ` +
         `If the evidence is missing, say so honestly instead of fabricating.\n\n` +
-        `Valid requirement IDs: ${[...validIds].join(', ') || '(none — leave requirement_ids empty)'}\n\n` +
+        `Valid requirement IDs and what each one means:\n${requirementGuide}\n` +
+        `Every flashcard requirement_ids entry MUST be one of the IDs above. ` +
+        `Never invent an ID and never reference an ID whose meaning is not listed here.\n\n` +
         `Return JSON: {"brief": {"summary": string, "what_they_do": string}, ` +
         `"flashcards": [{"front": string, "back": string, "requirement_ids": string[]}]}\n\n` +
         `EVIDENCE:\n${context.text}`,
@@ -331,9 +499,7 @@ export class KitGenerationService {
       `You write interview questions for candidates. Return only JSON matching the requested shape.`,
       `Write ${category} interview questions for a "${roleTitle}" candidate. ` +
         `Every question MUST reference at least one valid requirement ID below and must not duplicate ` +
-        `existing prompts. When there are no valid requirement IDs, write general ${category} questions ` +
-        `with empty requirement_ids instead of inventing requirements. ` +
-        `Calibrate difficulty 1 (junior) to 3 (staff+).\n\n` +
+        `existing prompts. Calibrate difficulty 1 (junior) to 3 (staff+).\n\n` +
         `Requirements:\n${pool.map((requirement) => `${requirement.id} [${requirement.priority}]: ${requirement.text}`).join('\n') || '(none)'}\n\n` +
         `${existingPrompts.length > 0 ? `Already asked (do not repeat):\n${existingPrompts.join('\n')}\n\n` : ''}` +
         `Return JSON: {"questions": [{"prompt": string, "answer_outline": string, "difficulty": 1|2|3, ` +

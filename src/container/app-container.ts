@@ -14,6 +14,8 @@ import { KitController } from '@/modules/kit/kit.controller';
 import { KitModel } from '@/modules/kit/kit.model';
 import { KitRepository } from '@/modules/kit/kit.repository';
 import { KitService } from '@/modules/kit/kit.service';
+import { IdempotencyModel } from '@/modules/kit/idempotency.model';
+import { IdempotencyRepository } from '@/modules/kit/idempotency.repository';
 import { RetrievalClient } from '@/modules/research/retrieval/retrieval-client.service';
 import { UrlSafetyService } from '@/modules/research/retrieval/url-safety.service';
 import { CompanyCrawlerService } from '@/modules/research/crawl/company-crawler.service';
@@ -27,9 +29,13 @@ import { RedisBraveGate } from '@/modules/research/search/brave-gate';
 import type { PublicSearchProvider } from '@/modules/research/search/search.type';
 import { PublicDiscussionResearchService } from '@/modules/research/discussion/public-discussion-research.service';
 import { CompanyResearchService } from '@/modules/research/company-research.service';
+import { ResearchCacheModel } from '@/modules/research/research-cache.model';
+import { ResearchCacheRepository } from '@/modules/research/research-cache.repository';
 import { resolveLlmAdapter } from '@/modules/generation/llm/resolve-llm-adapter';
 import type { LlmGenerationAdapter } from '@/modules/generation/llm/llm-adapter';
 import { KitGenerationService } from '@/modules/generation/kit-generation.service';
+import { GenerationCacheModel } from '@/modules/generation/generation-cache.model';
+import { GenerationCacheRepository } from '@/modules/generation/generation-cache.repository';
 import { createGenerationQueue } from '@/modules/generation/kit-generation.queue';
 import type { Queue } from 'bullmq';
 import type { GenerationJobData } from '@/modules/generation/generation.type';
@@ -50,6 +56,7 @@ export type AppContainer = {
   authController: Provider<AuthController>;
   healthController: Provider<HealthController>;
   kitRepository: Provider<KitRepository>;
+  idempotencyRepository: Provider<IdempotencyRepository>;
   kitService: Provider<KitService>;
   kitController: Provider<KitController>;
   urlSafetyService: Provider<UrlSafetyService>;
@@ -62,8 +69,10 @@ export type AppContainer = {
   publicSearchProvider: Provider<PublicSearchProvider | null>;
   publicDiscussionResearchService: Provider<PublicDiscussionResearchService>;
   companyResearchService: Provider<CompanyResearchService>;
+  researchCacheRepository: Provider<ResearchCacheRepository>;
   llmAdapter: Provider<LlmGenerationAdapter>;
   kitGenerationService: Provider<KitGenerationService>;
+  generationCacheRepository: Provider<GenerationCacheRepository>;
   generationQueue: Provider<Queue<GenerationJobData>>;
 };
 
@@ -132,6 +141,14 @@ export const createAppContainer = (config: AppConfig): AppContainer => {
     () =>
       new KitRepository({
         kitModel: KitModel,
+        logger: logger(),
+      }),
+  );
+
+  const idempotencyRepository = singleton(
+    () =>
+      new IdempotencyRepository({
+        idempotencyModel: IdempotencyModel,
         logger: logger(),
       }),
   );
@@ -214,6 +231,16 @@ export const createAppContainer = (config: AppConfig): AppContainer => {
       new CompanyResearchService({
         companyCrawler: companyCrawlerService(),
         discussionResearch: publicDiscussionResearchService(),
+        cache: researchCacheRepository(),
+        logger: logger(),
+      }),
+  );
+
+  const researchCacheRepository = singleton(
+    () =>
+      new ResearchCacheRepository({
+        researchCacheModel: ResearchCacheModel,
+        ttlHours: config.researchCacheTtlHours,
         logger: logger(),
       }),
   );
@@ -239,6 +266,16 @@ export const createAppContainer = (config: AppConfig): AppContainer => {
       new KitGenerationService({
         research: companyResearchService(),
         llm: llmAdapter(),
+        cache: generationCacheRepository(),
+        logger: logger(),
+      }),
+  );
+
+  const generationCacheRepository = singleton(
+    () =>
+      new GenerationCacheRepository({
+        generationCacheModel: GenerationCacheModel,
+        ttlDays: config.generationCacheTtlDays,
         logger: logger(),
       }),
   );
@@ -251,6 +288,7 @@ export const createAppContainer = (config: AppConfig): AppContainer => {
     () =>
       new KitService({
         kitRepository: kitRepository(),
+        idempotency: idempotencyRepository(),
         generationQueue: generationQueue(),
         kitGeneration: kitGenerationService,
         research: companyResearchService(),
@@ -271,6 +309,7 @@ export const createAppContainer = (config: AppConfig): AppContainer => {
     authController,
     healthController,
     kitRepository,
+    idempotencyRepository,
     kitService,
     kitController,
     urlSafetyService,
@@ -283,8 +322,10 @@ export const createAppContainer = (config: AppConfig): AppContainer => {
     publicSearchProvider,
     publicDiscussionResearchService,
     companyResearchService,
+    researchCacheRepository,
     llmAdapter,
     kitGenerationService,
+    generationCacheRepository,
     generationQueue,
   };
 };

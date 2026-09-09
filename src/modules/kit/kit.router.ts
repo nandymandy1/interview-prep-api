@@ -9,6 +9,7 @@ import {
   createKitValidator,
   deleteFlashcardValidator,
   deleteQuestionValidator,
+  idempotencyKeyValidator,
   kitIdParamValidator,
   listKitsValidator,
   recordPracticeValidator,
@@ -43,7 +44,7 @@ export const createKitRouter = ({
 
   router.post(
     '/',
-    createKitValidator,
+    [...idempotencyKeyValidator, ...createKitValidator],
     validationMiddleware,
     wrapRoute(kitController, 'create', 'kit.create'),
   );
@@ -78,7 +79,7 @@ export const createKitRouter = ({
 
   router.post(
     '/:kitId/questions',
-    addQuestionValidator,
+    [...idempotencyKeyValidator, ...addQuestionValidator],
     validationMiddleware,
     wrapRoute(kitController, 'addQuestion', 'kit.addQuestion'),
   );
@@ -99,7 +100,7 @@ export const createKitRouter = ({
 
   router.post(
     '/:kitId/flashcards',
-    addFlashcardValidator,
+    [...idempotencyKeyValidator, ...addFlashcardValidator],
     validationMiddleware,
     wrapRoute(kitController, 'addFlashcard', 'kit.addFlashcard'),
   );
@@ -127,7 +128,7 @@ export const createKitRouter = ({
 
   router.post(
     '/:kitId/regenerate',
-    regenerateValidator,
+    [...idempotencyKeyValidator, ...regenerateValidator],
     validationMiddleware,
     wrapRoute(kitController, 'regenerate', 'kit.regenerate'),
   );

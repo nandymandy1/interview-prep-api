@@ -188,7 +188,7 @@ export class BraveSearchProvider implements PublicSearchProvider {
     headers: Record<string, string>,
   ): SearchProviderException {
     const retryAfterMs =
-      status === 429
+      status === 429 || SEARCH_RETRYABLE_STATUSES.has(status)
         ? (parseRetryAfterMs(headers['retry-after'], this.now()) ?? undefined)
         : undefined;
 
@@ -201,6 +201,7 @@ export class BraveSearchProvider implements PublicSearchProvider {
 
     return new SearchProviderException('HTTP_ERROR', `The search provider responded ${status}.`, {
       status,
+      ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
     });
   }
 

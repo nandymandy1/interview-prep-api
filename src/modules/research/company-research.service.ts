@@ -3,6 +3,8 @@ import type { CompanyCrawlerService } from '@/modules/research/crawl/company-cra
 import type { CompanyCrawlResult } from '@/modules/research/crawl/crawl.type';
 import type { PublicDiscussionResearchService } from '@/modules/research/discussion/public-discussion-research.service';
 import type { PublicDiscussionResearchResult } from '@/modules/research/discussion/discussion.type';
+import type { ResearchCacheStore } from '@/modules/research/research-cache';
+import { researchCacheKey } from '@/modules/research/research-cache';
 import type { RetrievalMode } from '@/modules/research/retrieval/retrieval.type';
 
 export type CompanyResearchInput = {
@@ -31,6 +33,9 @@ type CompanyResearchDependencies = {
   companyCrawler: Pick<CompanyCrawlerService, 'crawlCompanySite'>;
   discussionResearch: Pick<PublicDiscussionResearchService, 'research'>;
   logger: LoggerService;
+  // Optional research cache seam: the application path passes a Mongo-backed
+  // store keyed by canonical URL + version + mode; the evaluator passes none.
+  cache?: ResearchCacheStore;
 };
 
 // Discussion search prefers a real homepage title over a hostname guess, but
@@ -52,15 +57,28 @@ export class CompanyResearchService {
   private readonly companyCrawler: Pick<CompanyCrawlerService, 'crawlCompanySite'>;
   private readonly discussionResearch: Pick<PublicDiscussionResearchService, 'research'>;
   private readonly logger: LoggerService;
+  private readonly cache: ResearchCacheStore | undefined;
 
   constructor(dependencies: CompanyResearchDependencies) {
     this.companyCrawler = dependencies.companyCrawler;
     this.discussionResearch = dependencies.discussionResearch;
     this.logger = dependencies.logger;
+    this.cache = dependencies.cache;
   }
 
   async researchCompany(input: CompanyResearchInput): Promise<CompanyResearchResult> {
     const startedAt = Date.now();
+    const cacheKey = researchCacheKey(input.companyUrl, input.mode);
+
+    const reused = await this.findFreshResearch(cacheKey);
+
+    if (reused) {
+      this.logger.info('research.cache_hit', {
+        durationMs: Date.now() - startedAt,
+      });
+
+      return { ...reused, companyUrl: input.companyUrl };
+    }
 
     const companySite = await this.companyCrawler.crawlCompanySite({
       companyUrl: input.companyUrl,
@@ -104,12 +122,34 @@ export class CompanyResearchService {
       durationMs: Date.now() - startedAt,
     });
 
-    return {
+    const result: CompanyResearchResult = {
       companyUrl: input.companyUrl,
       companySite,
       publicDiscussions,
       status,
       failures,
     };
+
+    // Best-effort: a research-cache write failure never fails research.
+    try {
+      await this.cache?.store(cacheKey, result);
+    } catch {
+      this.logger.warn('research.cache_store_failed', {});
+    }
+
+    return result;
+  }
+
+  private async findFreshResearch(cacheKey: string): Promise<CompanyResearchResult | null> {
+    if (!this.cache) {
+      return null;
+    }
+
+    try {
+      return await this.cache.findFresh(cacheKey);
+    } catch {
+      this.logger.warn('research.cache_lookup_failed', {});
+      return null;
+    }
   }
 }

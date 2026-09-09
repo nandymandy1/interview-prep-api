@@ -102,7 +102,10 @@ const kitSchema = new Schema<Kit>(
   },
   {
     timestamps: true,
-    versionKey: false,
+    // __v stays enabled on purpose: builder mutations pass the version they
+    // read, and a stale write becomes a structured 409 instead of silently
+    // clobbering another edit. __v never enters the canonical InterviewKit.
+    optimisticConcurrency: true,
   },
 );
 

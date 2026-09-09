@@ -30,6 +30,7 @@ import type {
   UpdateQuestionInput,
 } from '@/modules/kit/kit-api.type';
 import type { EditorMeta, KitDocument } from '@/modules/kit/kit.model';
+import type { IdempotencyRepository } from '@/modules/kit/idempotency.repository';
 import type { KitRepository } from '@/modules/kit/kit.repository';
 import type { InterviewKit, KitFlashcard, KitQuestion } from '@/modules/kit/kit.type';
 import type { Provider } from '@/common/providers/provider';
@@ -37,12 +38,16 @@ import { prepareSchedule } from '@/modules/schedule/schedule.service';
 
 export type KitServiceDependencies = {
   kitRepository: KitRepository;
+  idempotency: IdempotencyRepository;
   generationQueue: Queue<GenerationJobData>;
   // Lazy provider: resolving the generation service builds the LLM adapter,
   // which throws when unconfigured. createKit must work without keys (the
   // worker reports the config error on the job instead).
   kitGeneration: Provider<
-    Pick<KitGenerationService, 'generateBrief' | 'generateCategoryQuestions' | 'validateEditedKit'>
+    Pick<
+      KitGenerationService,
+      'generateBrief' | 'generateCategoryQuestions' | 'repairQuestions' | 'validateEditedKit'
+    >
   >;
   research: Pick<CompanyResearchService, 'researchCompany'>;
   logger: LoggerService;
@@ -55,6 +60,9 @@ const STATUS_STEPS: ReadonlyArray<{ key: string; label: string }> = [
   { key: 'checking-coverage', label: 'Checking coverage' },
   { key: 'building-schedule', label: 'Building schedule' },
 ];
+
+// Stale-write message surfaced by the frontend with a refetch.
+export const KIT_CONFLICT_MESSAGE = 'Kit changed; refreshing latest version.';
 
 const questionMetaOf = (
   meta: EditorMeta,
@@ -75,6 +83,15 @@ const isPreserved = (meta: EditorMeta, id: string): boolean => {
   return flags.pinned === true || flags.edited === true || flags.manual === true;
 };
 
+// __v lives on the Kit document only — never inside the canonical
+// InterviewKit JSON.
+const docVersion = (doc: KitDocument): number | undefined => {
+  const version = (doc as unknown as { __v?: unknown }).__v;
+  return typeof version === 'number' ? version : undefined;
+};
+
+const idempotencyKeyPrefix = (key: string): string => key.slice(0, 8);
+
 export class KitService {
   constructor(private readonly dependencies: KitServiceDependencies) {}
 
@@ -92,13 +109,35 @@ export class KitService {
   // Persist the queued kit first (userId from the session, never the body),
   // then enqueue exactly one generation job keyed by kitId. Return now: the
   // worker thread does research + generation off the event loop.
-  async createKit(userId: string, input: CreateKitInput): Promise<CreateKitResult> {
+  //
+  // With an Idempotency-Key, the same logical submission retries to the
+  // ORIGINAL kit: one Kit, one BullMQ job (jobId = kitId is the second
+  // protection). A new intentional click must send a NEW key.
+  async createKit(
+    userId: string,
+    input: CreateKitInput,
+    idempotencyKey?: string,
+  ): Promise<CreateKitResult> {
+    const operation = 'create-kit';
+
+    if (idempotencyKey) {
+      const replay = await this.replayCreate(userId, operation, idempotencyKey);
+
+      if (replay) {
+        return replay;
+      }
+    }
+
     const kit = await this.dependencies.kitRepository.create({
       userId,
       jd: input.jd,
       companyUrl: input.companyUrl,
       days: input.days,
     });
+
+    if (idempotencyKey) {
+      await this.dependencies.idempotency.attachResource(userId, operation, idempotencyKey, kit.id);
+    }
 
     try {
       await enqueueKitGeneration(this.dependencies.generationQueue, {
@@ -114,12 +153,87 @@ export class KitService {
         stageMessage: 'Could not enqueue generation.',
         error: { code: 'ENQUEUE_FAILED', message: 'Could not start generation. Try again.' },
       });
+
+      if (idempotencyKey) {
+        await this.dependencies.idempotency.fail(userId, operation, idempotencyKey);
+      }
+
       throw error;
     }
 
-    this.dependencies.logger.info('kit.created', { userId, kitId: kit.id });
+    if (idempotencyKey) {
+      await this.dependencies.idempotency.complete(userId, operation, idempotencyKey);
+    }
+
+    this.dependencies.logger.info('kit.created', {
+      userId,
+      kitId: kit.id,
+      ...(idempotencyKey ? { idempotencyKeyPrefix: idempotencyKeyPrefix(idempotencyKey) } : {}),
+    });
 
     return { kitId: kit.id, status: kit.status };
+  }
+
+  // Returns the original result when this key already completed, the live
+  // status when the first attempt is still processing, or null when the
+  // caller owns the key and must execute. A lost race (claim failed) replays
+  // the winner instead of creating a second kit.
+  private async replayCreate(
+    userId: string,
+    operation: string,
+    key: string,
+  ): Promise<CreateKitResult | null> {
+    const { idempotency, kitRepository } = this.dependencies;
+    const existing = await idempotency.find(userId, operation, key);
+
+    if (existing?.status === 'completed' && existing.resourceId) {
+      const kit = await kitRepository.findOwnedById(userId, existing.resourceId);
+
+      return { kitId: existing.resourceId, status: kit?.status ?? 'queued' };
+    }
+
+    if (existing?.status === 'processing' && existing.resourceId) {
+      const kit = await kitRepository.findOwnedById(userId, existing.resourceId);
+
+      if (kit) {
+        return { kitId: kit.id, status: kit.status };
+      }
+
+      return null;
+    }
+
+    if (existing?.status === 'failed') {
+      return null;
+    }
+
+    if (!existing) {
+      const claim = await idempotency.claim(userId, operation, key);
+
+      if (!claim.claimed) {
+        return this.replayCreate(userId, operation, key);
+      }
+
+      return null;
+    }
+
+    // Processing without a resource yet: the first attempt is inside the
+    // millisecond window between claim and kit creation. Poll briefly, then
+    // report the conflict instead of creating a second kit.
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      await sleep(100);
+      const retry = await idempotency.find(userId, operation, key);
+
+      if (retry?.status === 'completed' && retry.resourceId) {
+        const kit = await kitRepository.findOwnedById(userId, retry.resourceId);
+        return { kitId: retry.resourceId, status: kit?.status ?? 'queued' };
+      }
+
+      if (retry?.status !== 'processing') {
+        return this.replayCreate(userId, operation, key);
+      }
+    }
+
+    throw new ConflictException('This create request is already being processed.');
   }
 
   async getKit(userId: string, kitId: string): Promise<KitDetailResult> {
@@ -148,6 +262,8 @@ export class KitService {
     };
   }
 
+  // SET semantics per flashcard: repeating the same confidence PATCH leaves
+  // exactly ONE logical f1 practice state.
   async recordPractice(
     userId: string,
     kitId: string,
@@ -161,7 +277,7 @@ export class KitService {
       throw new NotFoundException('Flashcard not found');
     }
 
-    await this.dependencies.kitRepository.addPracticeRecord(userId, kitId, {
+    await this.dependencies.kitRepository.setPracticeConfidence(userId, kitId, {
       flashcardId,
       confidence,
     });
@@ -204,41 +320,55 @@ export class KitService {
     });
   }
 
-  async addQuestion(userId: string, kitId: string, input: AddQuestionInput): Promise<InterviewKit> {
-    return this.mutateKit(userId, kitId, (kit, meta, sequences) => {
-      const requirementIds = new Set(kit.role.requirements.map((entry) => entry.id));
-      // Manual questions may legitimately reference nothing: thin kits have
-      // zero requirements, and no fake mapping is invented here.
-      const refs = [...new Set(input.requirement_ids ?? [])].filter((id) => requirementIds.has(id));
+  async addQuestion(
+    userId: string,
+    kitId: string,
+    input: AddQuestionInput,
+    idempotencyKey?: string,
+  ): Promise<InterviewKit> {
+    return this.idempotentKitMutation(
+      userId,
+      kitId,
+      `kit:${kitId}:add-question`,
+      idempotencyKey,
+      () =>
+        this.mutateKit(userId, kitId, (kit, meta, sequences) => {
+          const requirementIds = new Set(kit.role.requirements.map((entry) => entry.id));
+          // Manual questions may legitimately reference nothing: thin kits have
+          // zero requirements, and no fake mapping is invented here.
+          const refs = [...new Set(input.requirement_ids ?? [])].filter((id) =>
+            requirementIds.has(id),
+          );
 
-      const draft: QuestionDraft = {
-        prompt: input.prompt,
-        answer_outline: input.answer_outline,
-        category: input.category,
-        difficulty: input.difficulty ?? 2,
-        requirement_ids: refs,
-      };
-      const [first] = allocateQuestionIds([draft], sequences);
-      const created = first as KitQuestion;
-      kit.questions.push(created);
+          const draft: QuestionDraft = {
+            prompt: input.prompt,
+            answer_outline: input.answer_outline,
+            category: input.category,
+            difficulty: input.difficulty ?? 2,
+            requirement_ids: refs,
+          };
+          const [first] = allocateQuestionIds([draft], sequences);
+          const created = first as KitQuestion;
+          kit.questions.push(created);
 
-      // Keep the final-kit invariant (every question scheduled exactly once):
-      // manual questions join the last day.
-      const lastDay = kit.schedule.days[kit.schedule.days.length - 1];
+          // Keep the final-kit invariant (every question scheduled exactly once):
+          // manual questions join the last day.
+          const lastDay = kit.schedule.days[kit.schedule.days.length - 1];
 
-      if (lastDay) {
-        lastDay.question_ids.push(created.id);
-        lastDay.minutes = lastDay.question_ids.length * 30;
-      }
+          if (lastDay) {
+            lastDay.question_ids.push(created.id);
+            lastDay.minutes = lastDay.question_ids.length * 30;
+          }
 
-      kit.coverage = {
-        uncovered_requirement_ids: calculateCoverage(kit.role.requirements, kit.questions)
-          .uncovered_requirement_ids,
-        passes: kit.coverage.passes,
-      };
+          kit.coverage = {
+            uncovered_requirement_ids: calculateCoverage(kit.role.requirements, kit.questions)
+              .uncovered_requirement_ids,
+            passes: kit.coverage.passes,
+          };
 
-      return markQuestion(meta, created.id, { pinned: true, manual: true });
-    });
+          return markQuestion(meta, created.id, { pinned: true, manual: true });
+        }),
+    );
   }
 
   async reorderQuestions(
@@ -267,17 +397,16 @@ export class KitService {
     });
   }
 
+  // Retry-friendly: deleting an already-deleted question returns the current
+  // kit instead of failing. Honest thin kits may reach zero questions; an
+  // uncovered must is then shown truthfully, never auto-filled.
   async deleteQuestion(userId: string, kitId: string, questionId: string): Promise<InterviewKit> {
     return this.mutateKit(userId, kitId, (kit, meta) => {
       if (!kit.questions.some((question) => question.id === questionId)) {
-        throw new NotFoundException('Question not found');
+        return meta;
       }
 
       kit.questions = kit.questions.filter((question) => question.id !== questionId);
-
-      if (kit.questions.length === 0) {
-        throw new BadRequestException('A kit must keep at least one question.');
-      }
 
       for (const day of kit.schedule.days) {
         day.question_ids = day.question_ids.filter((id) => id !== questionId);
@@ -300,22 +429,30 @@ export class KitService {
     userId: string,
     kitId: string,
     input: AddFlashcardInput,
+    idempotencyKey?: string,
   ): Promise<InterviewKit> {
-    return this.mutateKit(userId, kitId, (kit, meta, sequences) => {
-      const requirementIds = new Set(kit.role.requirements.map((entry) => entry.id));
-      const draft: FlashcardDraft = {
-        front: input.front,
-        back: input.back,
-        requirement_ids: [...new Set(input.requirement_ids ?? [])].filter((id) =>
-          requirementIds.has(id),
-        ),
-      };
-      const [first] = allocateFlashcardIds([draft], sequences);
-      const created = first as KitFlashcard;
-      kit.flashcards.push(created);
+    return this.idempotentKitMutation(
+      userId,
+      kitId,
+      `kit:${kitId}:add-flashcard`,
+      idempotencyKey,
+      () =>
+        this.mutateKit(userId, kitId, (kit, meta, sequences) => {
+          const requirementIds = new Set(kit.role.requirements.map((entry) => entry.id));
+          const draft: FlashcardDraft = {
+            front: input.front,
+            back: input.back,
+            requirement_ids: [...new Set(input.requirement_ids ?? [])].filter((id) =>
+              requirementIds.has(id),
+            ),
+          };
+          const [first] = allocateFlashcardIds([draft], sequences);
+          const created = first as KitFlashcard;
+          kit.flashcards.push(created);
 
-      return markQuestion(meta, created.id, { pinned: true, manual: true });
-    });
+          return markQuestion(meta, created.id, { pinned: true, manual: true });
+        }),
+    );
   }
 
   async updateFlashcard(
@@ -346,7 +483,7 @@ export class KitService {
   async deleteFlashcard(userId: string, kitId: string, flashcardId: string): Promise<InterviewKit> {
     return this.mutateKit(userId, kitId, (kit, meta) => {
       if (!kit.flashcards.some((flashcard) => flashcard.id === flashcardId)) {
-        throw new NotFoundException('Flashcard not found');
+        return meta;
       }
 
       kit.flashcards = kit.flashcards.filter((flashcard) => flashcard.id !== flashcardId);
@@ -375,73 +512,29 @@ export class KitService {
     });
   }
 
+  // Regeneration triggers LLM calls and is idempotent per action key: the
+  // same key repeated returns the current kit without a second LLM call; a
+  // new click sends a new key. A regeneration that cannot cover a must
+  // requirement fails WITHOUT saving, preserving the persisted kit.
   async regenerate(
     userId: string,
     kitId: string,
     input: RegenerateSectionInput,
+    idempotencyKey?: string,
   ): Promise<InterviewKit> {
-    const doc = await this.requireCompletedKit(userId, kitId);
-    const content = structuredClone(doc.kit as InterviewKit);
-    const meta: EditorMeta = structuredClone(doc.editorMeta ?? {});
-    const sequences = { ...doc.idSequences };
+    const operation =
+      input.section === 'questions'
+        ? `kit:${kitId}:regenerate:questions:${input.category}`
+        : `kit:${kitId}:regenerate:${input.section}`;
 
-    if (input.section === 'schedule') {
-      // No LLM: deterministic schedule over the current questions.
-      content.schedule = {
-        days_available: doc.input.days,
-        days: prepareSchedule({
-          requirements: content.role.requirements,
-          questions: content.questions,
-          daysAvailable: doc.input.days,
-        }).schedule.days,
-      };
-    } else {
-      const context = await this.freshResearchContext(doc, content);
+    return this.idempotentKitMutation(userId, kitId, operation, idempotencyKey, async () => {
+      const doc = await this.requireCompletedKit(userId, kitId);
+      const content = structuredClone(doc.kit as InterviewKit);
+      const meta: EditorMeta = structuredClone(doc.editorMeta ?? {});
+      const sequences = { ...doc.idSequences };
 
-      if (input.section === 'company_brief') {
-        const brief = await this.dependencies.kitGeneration().generateBrief(
-          content.role.title,
-          content.role.requirements,
-          context,
-        );
-        const edited = new Set(meta.briefFields ?? []);
-
-        // Edited brief fields survive regeneration; only the rest refresh.
-        content.company_brief = {
-          summary: edited.has('summary') ? content.company_brief.summary : brief.summary,
-          what_they_do: edited.has('what_they_do')
-            ? content.company_brief.what_they_do
-            : brief.what_they_do,
-          sources: context.pagesUsed,
-        };
-      } else {
-        const fresh = await this.dependencies.kitGeneration().generateCategoryQuestions(
-          input.category,
-          content.role.title,
-          content.role.requirements,
-          context,
-        );
-        const preserved = content.questions.filter(
-          (question) => question.category !== input.category || isPreserved(meta, question.id),
-        );
-        const preservedIds = new Set(preserved.map((question) => question.id));
-        const created = allocateQuestionIds(
-          fresh.map((draft) => ({ ...draft, category: input.category })),
-          sequences,
-        );
-
-        for (const question of created) {
-          if (preservedIds.has(question.id)) {
-            throw new BadRequestException('Regeneration produced a duplicate question ID.');
-          }
-        }
-
-        content.questions = [...preserved, ...created];
-
-        // The question set changed: rebuild the deterministic schedule from
-        // ALL final questions instead of patching old day allocations. Days
-        // stay exact, every final question is allocated, and must coverage is
-        // enforced (an uncovered must fails the regen visibly, kit untouched).
+      if (input.section === 'schedule') {
+        // No LLM: deterministic schedule over the current questions.
         content.schedule = {
           days_available: doc.input.days,
           days: prepareSchedule({
@@ -450,29 +543,160 @@ export class KitService {
             daysAvailable: doc.input.days,
           }).schedule.days,
         };
+      } else {
+        const context = await this.freshResearchContext(doc, content);
 
-        content.coverage = {
-          uncovered_requirement_ids: calculateCoverage(content.role.requirements, content.questions)
-            .uncovered_requirement_ids,
-          passes: content.coverage.passes,
-        };
+        if (input.section === 'company_brief') {
+          const brief = await this.dependencies
+            .kitGeneration()
+            .generateBrief(content.role.title, content.role.requirements, context);
+          const edited = new Set(meta.briefFields ?? []);
+
+          // Edited brief fields survive regeneration; only the rest refresh.
+          content.company_brief = {
+            summary: edited.has('summary') ? content.company_brief.summary : brief.summary,
+            what_they_do: edited.has('what_they_do')
+              ? content.company_brief.what_they_do
+              : brief.what_they_do,
+            sources: context.pagesUsed,
+          };
+        } else {
+          const fresh = await this.dependencies
+            .kitGeneration()
+            .generateCategoryQuestions(
+              input.category,
+              content.role.title,
+              content.role.requirements,
+              context,
+            );
+          const preserved = content.questions.filter(
+            (question) => question.category !== input.category || isPreserved(meta, question.id),
+          );
+          const preservedIds = new Set(preserved.map((question) => question.id));
+          const created = allocateQuestionIds(
+            fresh.map((draft) => ({ ...draft, category: input.category })),
+            sequences,
+          );
+
+          for (const question of created) {
+            if (preservedIds.has(question.id)) {
+              throw new BadRequestException('Regeneration produced a duplicate question ID.');
+            }
+          }
+
+          content.questions = [...preserved, ...created];
+
+          // Exactly ONE targeted repair when a must requirement lost coverage;
+          // then coverage again. A still-uncovered must fails the regen WITHOUT
+          // saving, so the persisted kit is never left half-broken.
+          let coverage = calculateCoverage(content.role.requirements, content.questions);
+
+          if (coverage.uncovered_requirement_ids.length > 0) {
+            const repaired = await this.dependencies
+              .kitGeneration()
+              .repairQuestions(content.role.requirements, content.questions, context);
+            const repairedAllocated = allocateQuestionIds(repaired, sequences);
+
+            for (const question of repairedAllocated) {
+              if (preservedIds.has(question.id)) {
+                throw new BadRequestException('Regeneration produced a duplicate question ID.');
+              }
+            }
+
+            content.questions = [...content.questions, ...repairedAllocated];
+            coverage = calculateCoverage(content.role.requirements, content.questions);
+          }
+
+          if (coverage.uncovered_requirement_ids.length > 0) {
+            throw new ConflictException(
+              'Regeneration could not cover every must-have requirement; kit unchanged.',
+            );
+          }
+
+          // The question set changed: rebuild the deterministic schedule from
+          // ALL final questions instead of patching old day allocations.
+          content.schedule = {
+            days_available: doc.input.days,
+            days: prepareSchedule({
+              requirements: content.role.requirements,
+              questions: content.questions,
+              daysAvailable: doc.input.days,
+            }).schedule.days,
+          };
+
+          content.coverage = {
+            uncovered_requirement_ids: coverage.uncovered_requirement_ids,
+            passes: content.coverage.passes,
+          };
+        }
+      }
+
+      const validated = this.dependencies.kitGeneration().validateEditedKit(content);
+      const saved = await this.dependencies.kitRepository.saveEditedKit(
+        userId,
+        kitId,
+        validated,
+        sequences,
+        meta,
+        docVersion(doc),
+      );
+
+      if (!saved) {
+        throw await this.conflictOrNotFound(userId, kitId);
+      }
+
+      return validated;
+    });
+  }
+
+  // Same key repeated → the previously completed result (current kit), no
+  // second side effect. A lost claim race replays the winner. Failed records
+  // re-claim so the same key can retry after a failure.
+  private async idempotentKitMutation(
+    userId: string,
+    kitId: string,
+    operation: string,
+    key: string | undefined,
+    mutate: () => Promise<InterviewKit>,
+  ): Promise<InterviewKit> {
+    if (!key) {
+      return mutate();
+    }
+
+    const { idempotency } = this.dependencies;
+    const existing = await idempotency.find(userId, operation, key);
+
+    if (existing?.status === 'completed') {
+      return this.currentKitContent(userId, kitId);
+    }
+
+    if (existing?.status === 'processing') {
+      return this.currentKitContent(userId, kitId);
+    }
+
+    // A failed record re-runs under the same key; complete()/fail() below
+    // transition it out of the failed state.
+    if (!existing) {
+      const claim = await idempotency.claim(userId, operation, key);
+
+      if (!claim.claimed) {
+        return this.currentKitContent(userId, kitId);
       }
     }
 
-    const validated = this.dependencies.kitGeneration().validateEditedKit(content);
-    const saved = await this.dependencies.kitRepository.saveEditedKit(
-      userId,
-      kitId,
-      validated,
-      sequences,
-      meta,
-    );
-
-    if (!saved) {
-      throw new NotFoundException('Kit not found');
+    try {
+      const result = await mutate();
+      await idempotency.complete(userId, operation, key);
+      return result;
+    } catch (error) {
+      await idempotency.fail(userId, operation, key);
+      throw error;
     }
+  }
 
-    return validated;
+  private async currentKitContent(userId: string, kitId: string): Promise<InterviewKit> {
+    const kit = await this.requireCompletedKit(userId, kitId);
+    return structuredClone(kit.kit as InterviewKit);
   }
 
   private async freshResearchContext(
@@ -510,13 +734,29 @@ export class KitService {
       validated,
       sequences,
       nextMeta,
+      docVersion(doc),
     );
 
     if (!saved) {
-      throw new NotFoundException('Kit not found');
+      throw await this.conflictOrNotFound(userId, kitId);
     }
 
     return validated;
+  }
+
+  // A save that matches nothing means the version moved (concurrent edit →
+  // 409 with a refetch hint) or the kit vanished (404). Never silent.
+  private async conflictOrNotFound(
+    userId: string,
+    kitId: string,
+  ): Promise<ConflictException | NotFoundException> {
+    const stillThere = await this.dependencies.kitRepository.findOwnedById(userId, kitId);
+
+    if (stillThere) {
+      return new ConflictException(KIT_CONFLICT_MESSAGE);
+    }
+
+    return new NotFoundException('Kit not found');
   }
 
   private async requireOwnedKit(userId: string, kitId: string): Promise<KitDocument> {
@@ -594,3 +834,8 @@ export class KitService {
     };
   }
 }
+
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });

@@ -17,16 +17,47 @@ const bootstrap = async (): Promise<void> => {
 
   // Critical infrastructure is deliberately resolved and connected at boot.
   // Application services/controllers remain lazy singletons.
-  await container.mongoDatabase().connect();
-  await container.redis().connect();
+  try {
+    await container.mongoDatabase().connect();
+    await container.redis().connect();
+  } catch (error) {
+    logger.error(error, 'infrastructure.connect_failed');
+
+    await Promise.allSettled([
+      container.mongoDatabase().disconnect(),
+      container.redis().disconnect(),
+    ]);
+
+    process.exitCode = 1;
+    return;
+  }
 
   // Same deployment: the BullMQ worker (sandboxed thread) and the progress
   // subscriber start with the API. No second service required. A worker that
   // cannot start aborts boot: an API that listens but can never process a
   // generation job would strand kits in queued forever.
-  const worker: Worker<GenerationJobData> = startGenerationWorker(config.redisUrl, logger);
-  await worker.waitUntilReady();
-  const subscriber: Redis = await startProgressSubscriber(container.redis().getClient(), logger);
+  let worker: Worker<GenerationJobData> | null = null;
+  let subscriber: Redis | null = null;
+
+  try {
+    worker = startGenerationWorker(config.redisUrl, logger);
+    await worker.waitUntilReady();
+    subscriber = await startProgressSubscriber(container.redis().getClient(), logger);
+  } catch (error) {
+    // Clean failure: close everything opened so far (worker, Mongo, Redis)
+    // so the backend does not linger alive on open sockets, then exit. No
+    // HTTP server has started listening at this point.
+    logger.error(error, 'worker.startup_failed');
+
+    await Promise.allSettled([
+      ...(worker ? [worker.close()] : []),
+      container.mongoDatabase().disconnect(),
+      container.redis().disconnect(),
+    ]);
+
+    process.exitCode = 1;
+    return;
+  }
 
   const app = createApp(config, container);
   const server = createServer(app);

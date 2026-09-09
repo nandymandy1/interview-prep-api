@@ -46,11 +46,15 @@ export class KitController {
   }
 
   async create(req: Request, res: Response): Promise<void> {
-    const result = await this.dependencies.kitService.createKit(this.requireUserId(req), {
-      jd: String(req.body.jd),
-      companyUrl: String(req.body.companyUrl),
-      days: Number(req.body.days),
-    });
+    const result = await this.dependencies.kitService.createKit(
+      this.requireUserId(req),
+      {
+        jd: String(req.body.jd),
+        companyUrl: String(req.body.companyUrl),
+        days: Number(req.body.days),
+      },
+      this.idempotencyKey(req),
+    );
 
     const response: ApiSuccessResponse<CreateKitResult> = {
       success: true,
@@ -121,6 +125,7 @@ export class KitController {
       this.requireUserId(req),
       req.params.kitId as string,
       req.body as AddQuestionInput,
+      this.idempotencyKey(req),
     );
 
     const response: ApiSuccessResponse<InterviewKit> = { success: true, data: kit };
@@ -154,6 +159,7 @@ export class KitController {
       this.requireUserId(req),
       req.params.kitId as string,
       req.body as AddFlashcardInput,
+      this.idempotencyKey(req),
     );
 
     const response: ApiSuccessResponse<InterviewKit> = { success: true, data: kit };
@@ -199,10 +205,20 @@ export class KitController {
       this.requireUserId(req),
       req.params.kitId as string,
       req.body as RegenerateSectionInput,
+      this.idempotencyKey(req),
     );
 
     const response: ApiSuccessResponse<InterviewKit> = { success: true, data: kit };
     res.status(200).json(response);
+  }
+
+  // Optional per-action key: the frontend sends one UUID per logical action
+  // and reuses it across transport retries. Absent keys execute normally.
+  private idempotencyKey(req: Request): string | undefined {
+    const raw = req.header('Idempotency-Key');
+    const key = typeof raw === 'string' ? raw.trim() : '';
+
+    return key ? key : undefined;
   }
 
   private requireUserId(req: Request): string {

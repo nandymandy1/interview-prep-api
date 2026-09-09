@@ -46,17 +46,25 @@ type MockRepository = {
       | 'create'
       | 'findByUserPaginated'
       | 'findOwnedById'
-      | 'addPracticeRecord'
+      | 'setPracticeConfidence'
       | 'updateGenerationState'
   ]: ReturnType<typeof vi.fn>;
 };
+
+const fakeIdempotency = () => ({
+  find: vi.fn(async () => null),
+  claim: vi.fn(async () => ({ claimed: true as const, record: {} })),
+  attachResource: vi.fn(async () => undefined),
+  complete: vi.fn(async () => undefined),
+  fail: vi.fn(async () => undefined),
+});
 
 const mockRepository = (): KitRepository & MockRepository =>
   ({
     create: vi.fn(),
     findByUserPaginated: vi.fn(),
     findOwnedById: vi.fn(),
-    addPracticeRecord: vi.fn(),
+    setPracticeConfidence: vi.fn(),
     updateGenerationState: vi.fn(),
   }) as unknown as KitRepository & MockRepository;
 
@@ -94,6 +102,7 @@ const buildApp = (repository: KitRepository & MockRepository, userId?: string) =
   const queueAdd = vi.fn(async () => ({}));
   const kitService = new KitService({
     kitRepository: repository,
+    idempotency: fakeIdempotency() as never,
     generationQueue: { add: queueAdd } as never,
     kitGeneration: (() => ({})) as never,
     research: {} as never,
@@ -126,7 +135,7 @@ const ownedRepository = (): KitRepository & MockRepository => {
   repository.findOwnedById.mockImplementation(async (userId: string, kitId: string) =>
     userId === USER_A && kitId === KIT_A ? kitDoc() : null,
   );
-  repository.addPracticeRecord.mockImplementation(async () => kitDoc());
+  repository.setPracticeConfidence.mockImplementation(async () => kitDoc());
   return repository;
 };
 
@@ -248,6 +257,7 @@ describe('kit owner scoping', () => {
     };
     const service = new KitService({
       kitRepository: repository,
+      idempotency: fakeIdempotency() as never,
       generationQueue: { add: vi.fn(async () => ({})) } as never,
       kitGeneration: throwingGeneration as never,
       research: {} as never,
@@ -334,6 +344,7 @@ describe('kit list pagination validation', () => {
   it('rejects unsafe integers before pagination', async () => {
     const service = new KitService({
       kitRepository: ownedRepository(),
+      idempotency: fakeIdempotency() as never,
       generationQueue: {} as never,
       kitGeneration: (() => ({})) as never,
       research: {} as never,
@@ -478,7 +489,7 @@ describe('kit status and practice', () => {
 
     expect(response.status).toBe(200);
     expect(response.body).toEqual({ success: true, data: { recorded: true } });
-    expect(repository.addPracticeRecord).toHaveBeenCalledWith(USER_A, KIT_A, {
+    expect(repository.setPracticeConfidence).toHaveBeenCalledWith(USER_A, KIT_A, {
       flashcardId: 'f1',
       confidence: 4,
     });

@@ -1,14 +1,31 @@
 import axios, { type AxiosInstance } from 'axios';
 import { z } from 'zod';
+import { retryWithBackoff } from '@/common/retry/retry-with-backoff';
 import type { LoggerService } from '@/infrastructure/logger/logger.service';
 import type { LlmGenerationAdapter, LlmJsonRequest } from '@/modules/generation/llm/llm-adapter';
 
 export const OPENAI_API_BASE = 'https://api.openai.com';
 export const OPENAI_TIMEOUT_MS = 60_000;
 export const OPENAI_MAX_RESPONSE_BYTES = 1024 * 1024;
-export const MAX_OPENAI_ATTEMPTS = 2;
+// Bounded retries: attempt 1 immediate, ~750ms + jitter, ~1500ms + jitter.
+export const MAX_OPENAI_ATTEMPTS = 3;
+export const OPENAI_BASE_RETRY_DELAY_MS = 750;
+export const OPENAI_MAX_RETRY_DELAY_MS = 10_000;
+export const OPENAI_RETRY_JITTER_MS = 250;
 
 const OPENAI_RETRYABLE_STATUSES: ReadonlySet<number> = new Set([429, 500, 502, 503, 504]);
+
+// Transient axios/network codes only. Auth/client errors (400/401/403) and
+// domain validation failures are never retried.
+const OPENAI_TRANSIENT_NETWORK_CODES: ReadonlySet<string> = new Set([
+  'ECONNABORTED',
+  'ETIMEDOUT',
+  'ECONNRESET',
+  'EPIPE',
+  'ENOTCONN',
+  'EAI_AGAIN',
+  'ERR_NETWORK',
+]);
 
 export type OpenAiExceptionCode =
   | 'OPENAI_NOT_CONFIGURED'
@@ -16,7 +33,8 @@ export type OpenAiExceptionCode =
   | 'OPENAI_RATE_LIMITED'
   | 'OPENAI_TIMEOUT'
   | 'OPENAI_NETWORK_ERROR'
-  | 'OPENAI_INVALID_RESPONSE';
+  | 'OPENAI_INVALID_RESPONSE'
+  | 'LLM_AUTH_INVALID';
 
 export class OpenAiException extends Error {
   readonly code: OpenAiExceptionCode;
@@ -58,6 +76,7 @@ type OpenAiGenerationAdapterDependencies = {
   logger: LoggerService;
   httpPost?: OpenAiHttpPost;
   sleep?: (ms: number) => Promise<void>;
+  random?: () => number;
 };
 
 const defaultSleep = (ms: number): Promise<void> =>
@@ -71,11 +90,13 @@ export class OpenAiGenerationAdapter implements LlmGenerationAdapter {
   readonly provider = 'openai' as const;
   private readonly httpPost: OpenAiHttpPost;
   private readonly sleep: (ms: number) => Promise<void>;
+  private readonly random: () => number;
   private readonly logger: LoggerService;
 
   constructor(private readonly dependencies: OpenAiGenerationAdapterDependencies) {
     this.logger = dependencies.logger;
     this.sleep = dependencies.sleep ?? defaultSleep;
+    this.random = dependencies.random ?? Math.random;
     this.httpPost = dependencies.httpPost ?? this.createDefaultHttpPost();
   }
 
@@ -90,10 +111,28 @@ export class OpenAiGenerationAdapter implements LlmGenerationAdapter {
     }
 
     const url = `${OPENAI_API_BASE}/v1/chat/completions`;
-    let lastFailure: OpenAiException | null = null;
 
-    for (let attempt = 1; attempt <= MAX_OPENAI_ATTEMPTS; attempt += 1) {
-      try {
+    // HTTP transient failures retry here (max 3). Successful HTTP with
+    // invalid JSON/schema gets at most one corrective call from the pipeline
+    // layer — never nested inside these attempts.
+    return retryWithBackoff({
+      maxAttempts: MAX_OPENAI_ATTEMPTS,
+      baseDelayMs: OPENAI_BASE_RETRY_DELAY_MS,
+      maxDelayMs: OPENAI_MAX_RETRY_DELAY_MS,
+      jitterMs: OPENAI_RETRY_JITTER_MS,
+      sleep: this.sleep,
+      random: this.random,
+      shouldRetry: (error) => this.isRetryable(this.normalizeError(error)),
+      getRetryAfterMs: (error) => this.normalizeError(error).retryAfterMs,
+      onRetry: ({ attempt, delayMs, error }) => {
+        const failure = this.normalizeError(error);
+        this.logger.warn('openai.attempt_failed', {
+          attempt,
+          code: failure.code,
+          retryDelayMs: delayMs,
+        });
+      },
+      operation: async () => {
         const response = await this.httpPost(
           url,
           {
@@ -113,20 +152,8 @@ export class OpenAiGenerationAdapter implements LlmGenerationAdapter {
         }
 
         return this.parsePayload(response.data, schema);
-      } catch (error) {
-        const failure = this.normalizeError(error);
-
-        if (!this.isRetryable(failure) || attempt >= MAX_OPENAI_ATTEMPTS) {
-          throw failure;
-        }
-
-        lastFailure = failure;
-        this.logger.warn('openai.attempt_failed', { attempt, code: failure.code });
-        await this.sleep(this.retryDelayMs(attempt, failure));
-      }
-    }
-
-    throw lastFailure ?? new OpenAiException('OPENAI_NETWORK_ERROR', 'OpenAI call failed.');
+      },
+    });
   }
 
   private parsePayload<T>(data: unknown, schema: z.ZodType<T>): T {
@@ -168,6 +195,13 @@ export class OpenAiGenerationAdapter implements LlmGenerationAdapter {
   private statusToException(status: number, headers: Record<string, string>): OpenAiException {
     const retryAfterMs = parseRetryAfterMs(headers['retry-after']);
 
+    // Authentication is validated on first real provider call, never at boot
+    // (no paid call per startup). 401/403 normalize to LLM_AUTH_INVALID and
+    // are never retried.
+    if (status === 401 || status === 403) {
+      return new OpenAiException('LLM_AUTH_INVALID', 'OpenAI rejected the API key.', { status });
+    }
+
     if (status === 429) {
       return new OpenAiException('OPENAI_RATE_LIMITED', 'OpenAI rate-limited the request.', {
         status,
@@ -182,22 +216,23 @@ export class OpenAiGenerationAdapter implements LlmGenerationAdapter {
   }
 
   private isRetryable(error: OpenAiException): boolean {
-    return (
-      error.code === 'OPENAI_RATE_LIMITED' ||
-      error.code === 'OPENAI_TIMEOUT' ||
-      error.code === 'OPENAI_NETWORK_ERROR' ||
-      (error.code === 'OPENAI_HTTP_ERROR' &&
-        error.status !== undefined &&
-        OPENAI_RETRYABLE_STATUSES.has(error.status))
-    );
-  }
-
-  private retryDelayMs(attempt: number, failure: OpenAiException): number {
-    if (failure.retryAfterMs !== undefined) {
-      return Math.min(failure.retryAfterMs, 30_000);
+    if (error.code === 'LLM_AUTH_INVALID' || error.code === 'OPENAI_INVALID_RESPONSE') {
+      return false;
     }
 
-    return 1000 * attempt;
+    if (error.code === 'OPENAI_RATE_LIMITED' || error.code === 'OPENAI_TIMEOUT') {
+      return true;
+    }
+
+    if (error.code === 'OPENAI_NETWORK_ERROR') {
+      return isTransientNetworkCause(error.cause);
+    }
+
+    return (
+      error.code === 'OPENAI_HTTP_ERROR' &&
+      error.status !== undefined &&
+      OPENAI_RETRYABLE_STATUSES.has(error.status)
+    );
   }
 
   private normalizeError(error: unknown): OpenAiException {
@@ -261,4 +296,20 @@ const parseRetryAfterMs = (value: string | undefined): number | undefined => {
   }
 
   return undefined;
+};
+
+// Only transient network failures retry. A missing code is treated as a
+// temporary network failure (DNS/TLS/unknown transport error); anything else
+// (config, client misuse) fails fast.
+const isTransientNetworkCause = (cause: unknown): boolean => {
+  if (cause === undefined || cause === null) {
+    return true;
+  }
+
+  if (typeof cause === 'object' && 'code' in cause) {
+    const code = (cause as { code?: unknown }).code;
+    return typeof code !== 'string' || OPENAI_TRANSIENT_NETWORK_CODES.has(code);
+  }
+
+  return true;
 };

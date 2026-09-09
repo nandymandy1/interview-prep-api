@@ -556,6 +556,12 @@ describe('builder preservation', () => {
         saveEditedKit,
         updateGenerationState: vi.fn(),
       } as never,
+      idempotency: {
+        find: vi.fn(async () => null),
+        claim: vi.fn(async () => ({ claimed: true as const, record: {} })),
+        complete: vi.fn(async () => undefined),
+        fail: vi.fn(async () => undefined),
+      } as never,
       generationQueue: {} as never,
       kitGeneration: () => ({
         generateBrief:
@@ -571,6 +577,7 @@ describe('builder preservation', () => {
               requirement_ids: ['r1'],
             },
           ]),
+        repairQuestions: vi.fn(async () => []),
         validateEditedKit: validateInterviewKit,
       }),
       research: { researchCompany: vi.fn(async () => fakeResearchResult()) },
@@ -621,6 +628,12 @@ describe('practice guard', () => {
       kitRepository: {
         findOwnedById: vi.fn(async () => completedDoc({ status: 'queued', kit: null })),
       } as never,
+      idempotency: {
+        find: vi.fn(async () => null),
+        claim: vi.fn(async () => ({ claimed: true as const, record: {} })),
+        complete: vi.fn(async () => undefined),
+        fail: vi.fn(async () => undefined),
+      } as never,
       generationQueue: {} as never,
       kitGeneration: (() => ({})) as never,
       research: {} as never,
@@ -628,5 +641,183 @@ describe('practice guard', () => {
     });
 
     await expect(service.recordPractice('user-a', 'kit', 'f1', 4)).rejects.toThrow('not ready');
+  });
+});
+
+describe('thin-jd determinism', () => {
+  const thinGeneration = () => {
+    const calls: string[] = [];
+    const generateJson = vi.fn(async (request: { systemPrompt: string; userPrompt: string }) => {
+      const prompt = `${request.systemPrompt}\n\n${request.userPrompt}`;
+
+      if (prompt.includes('Extract the hiring signal')) {
+        calls.push('extraction');
+        return { ...extractionFixture, requirements: [] };
+      }
+
+      if (prompt.includes('company brief from the evidence')) {
+        calls.push('brief');
+        return { brief: briefFixture.brief, flashcards: [] };
+      }
+
+      calls.push(`unexpected:${prompt.slice(0, 40)}`);
+      return { questions: [] };
+    });
+
+    const generation = new KitGenerationService({
+      research: { researchCompany: vi.fn(async () => fakeResearchResult()) },
+      llm: { provider: 'openai', generateJson } as never,
+      logger: silentLogger(),
+    });
+
+    return { generation, calls };
+  };
+
+  it('two-line JD with no requirements makes zero category calls', async () => {
+    const { generation, calls } = thinGeneration();
+
+    const { kit } = await generation.generate({
+      jd: 'Backend Engineer.\nJoin our team.',
+      companyUrl: 'https://acme.test',
+      days: 2,
+      mode: 'evaluation' as const,
+    });
+
+    expect(calls).toEqual(['extraction', 'brief']);
+    expect(kit.questions).toEqual([]);
+    expect(kit.flashcards).toEqual([]);
+    expect(kit.coverage).toEqual({ uncovered_requirement_ids: [], passes: 1 });
+    expect(kit.schedule.days).toHaveLength(2);
+    expect(() => validateFinalInterviewKit(kit)).not.toThrow();
+  });
+
+  it('flashcard prompt carries the requirement id to text mapping', async () => {
+    const seen: string[] = [];
+    const generateJson = vi.fn(async (request: { systemPrompt: string; userPrompt: string }) => {
+      const prompt = `${request.systemPrompt}\n\n${request.userPrompt}`;
+
+      if (prompt.includes('Extract the hiring signal')) {
+        return extractionFixture;
+      }
+
+      if (prompt.includes('company brief from the evidence')) {
+        seen.push(prompt);
+        return briefFixture;
+      }
+
+      if (prompt.includes('no interview question yet')) {
+        return repairFixture;
+      }
+
+      return categoryFixture('technical', true);
+    });
+    const generation = new KitGenerationService({
+      research: { researchCompany: vi.fn(async () => fakeResearchResult()) },
+      llm: { provider: 'openai', generateJson } as never,
+      logger: silentLogger(),
+    });
+
+    await generation.generate(generationInput(2));
+
+    expect(seen).toHaveLength(1);
+    const briefPrompt = seen[0] as string;
+    expect(briefPrompt).toContain('r1 [must][technical]: Build Node.js APIs');
+    expect(briefPrompt).toContain('r2 [must][behavioural]: Mentor junior engineers');
+  });
+});
+
+describe('exact-input generation cache', () => {
+  const fakeCache = () => {
+    const entries = new Map<string, { content: never }>();
+    return {
+      findFresh: vi.fn(async (fingerprint: string) => entries.get(fingerprint) ?? null),
+      upsert: vi.fn(async (input: { fingerprint: string; content: never }) => {
+        entries.set(input.fingerprint, { content: input.content });
+      }),
+    };
+  };
+
+  it('hit skips research and LLM calls and rebuilds the schedule for new days', async () => {
+    const script = scriptGemini(true);
+    const researchCompany = vi.fn(async () => fakeResearchResult());
+    const cache = fakeCache();
+    const build = () =>
+      new KitGenerationService({
+        research: { researchCompany },
+        llm: { provider: 'gemini', generateJson: script.generateJson } as never,
+        cache: cache as never,
+        logger: silentLogger(),
+      });
+
+    const first = await build().generate(generationInput(3));
+    expect(first.kit.schedule.days).toHaveLength(3);
+    expect(cache.upsert).toHaveBeenCalledTimes(1);
+
+    researchCompany.mockClear();
+    script.generateJson.mockClear();
+
+    const second = await build().generate({ ...generationInput(5) });
+
+    expect(researchCompany).not.toHaveBeenCalled();
+    expect(script.generateJson).not.toHaveBeenCalled();
+    // Same pristine material, new exact-day schedule.
+    expect(second.kit.questions).toEqual(first.kit.questions);
+    expect(second.kit.flashcards).toEqual(first.kit.flashcards);
+    expect(second.kit.role.requirements).toEqual(first.kit.role.requirements);
+    expect(second.kit.schedule.days_available).toBe(5);
+    expect(second.kit.schedule.days).toHaveLength(5);
+    expect(() => validateFinalInterviewKit(second.kit)).not.toThrow();
+  });
+
+  it('same company with a different JD is a full cache miss', async () => {
+    const script = scriptGemini(true);
+    const researchCompany = vi.fn(async () => fakeResearchResult());
+    const cache = fakeCache();
+    const build = () =>
+      new KitGenerationService({
+        research: { researchCompany },
+        llm: { provider: 'gemini', generateJson: script.generateJson } as never,
+        cache: cache as never,
+        logger: silentLogger(),
+      });
+
+    await build().generate(generationInput(3));
+
+    researchCompany.mockClear();
+    script.generateJson.mockClear();
+
+    await build().generate({
+      ...generationInput(3),
+      jd: 'A completely different role: designer who paints murals.',
+    });
+
+    expect(researchCompany).toHaveBeenCalled();
+    expect(script.generateJson).toHaveBeenCalled();
+  });
+
+  it('invalid cached content is treated as a miss and replaced', async () => {
+    const script = scriptGemini(true);
+    const cache = fakeCache();
+    const generation = new KitGenerationService({
+      research: { researchCompany: vi.fn(async () => fakeResearchResult()) },
+      llm: { provider: 'gemini', generateJson: script.generateJson } as never,
+      cache: cache as never,
+      logger: silentLogger(),
+    });
+
+    await generation.generate(generationInput(3));
+
+    const firstCall = cache.upsert.mock.calls[0] as { fingerprint: string }[] | undefined;
+    const fingerprint = (firstCall as { fingerprint: string }[])[0]?.fingerprint as string;
+    (cache.findFresh as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      fingerprint,
+      content: { companyBrief: null },
+    });
+    script.generateJson.mockClear();
+
+    const { kit } = await generation.generate(generationInput(3));
+
+    expect(script.generateJson).toHaveBeenCalled();
+    expect(kit.questions.length).toBeGreaterThan(0);
   });
 });

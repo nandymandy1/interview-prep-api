@@ -119,28 +119,53 @@ export class KitRepository {
   }
 
   // Builder mutations persist the canonical kit plus editor metadata and the
-  // high-water sequences together; never one without the others.
+  // high-water sequences together; never one without the others. Pass the
+  // version the caller read: a stale write matches nothing (returns null) so
+  // the service can answer 409 instead of clobbering a concurrent edit.
   async saveEditedKit(
     userId: string,
     kitId: string,
     kit: InterviewKit,
     sequences: KitIdSequences,
     editorMeta: EditorMeta,
+    expectedVersion?: number,
   ): Promise<KitDocument | null> {
     return this.dependencies.kitModel.findOneAndUpdate(
-      { _id: kitId, userId },
-      { $set: { kit, idSequences: sequences, editorMeta } },
+      {
+        _id: kitId,
+        userId,
+        ...(expectedVersion !== undefined ? { __v: expectedVersion } : {}),
+      },
+      { $set: { kit, idSequences: sequences, editorMeta }, $inc: { __v: 1 } },
       { new: true },
     );
   }
 
-  async addPracticeRecord(
+  // Practice state is SET semantics per flashcard: repeating the same
+  // confidence PATCH leaves exactly ONE logical record, never a duplicate
+  // from a transport retry.
+  async setPracticeConfidence(
     userId: string,
     kitId: string,
     record: Omit<KitPracticeRecord, 'recordedAt'>,
   ): Promise<KitDocument | null> {
+    const updated = await this.dependencies.kitModel.findOneAndUpdate(
+      { _id: kitId, userId, 'practiceRecords.flashcardId': record.flashcardId },
+      {
+        $set: {
+          'practiceRecords.$.confidence': record.confidence,
+          'practiceRecords.$.recordedAt': new Date(),
+        },
+      },
+      { new: true },
+    );
+
+    if (updated) {
+      return updated;
+    }
+
     return this.dependencies.kitModel.findOneAndUpdate(
-      { _id: kitId, userId },
+      { _id: kitId, userId, 'practiceRecords.flashcardId': { $ne: record.flashcardId } },
       { $push: { practiceRecords: { ...record, recordedAt: new Date() } } },
       { new: true },
     );

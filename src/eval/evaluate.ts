@@ -194,6 +194,8 @@ const main = async (): Promise<void> => {
     redisUrl: 'redis://127.0.0.1:6379',
     sessionSecret: 'evaluator-never-connects-sessions-or-mongo',
     sessionCookieName: 'interview_prep.sid',
+    generationCacheTtlDays: 7,
+    researchCacheTtlHours: 24,
     logLevel: process.env.LOG_LEVEL?.trim() || 'info',
     ...(process.env.BRAVE_SEARCH_API_KEY?.trim()
       ? { braveSearchApiKey: process.env.BRAVE_SEARCH_API_KEY.trim() }
