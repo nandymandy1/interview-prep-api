@@ -40,3 +40,116 @@ export const recordPracticeValidator = [
     .withMessage('Confidence must be an integer between 1 and 5')
     .toInt(),
 ];
+
+const questionIdParamValidator = [
+  param('questionId').isString().trim().notEmpty().withMessage('A valid question id is required'),
+];
+
+const flashcardIdParamValidator = [
+  param('flashcardId').isString().trim().notEmpty().withMessage('A valid flashcard id is required'),
+];
+
+export const updateQuestionValidator = [
+  ...kitIdParamValidator,
+  ...questionIdParamValidator,
+  body('prompt')
+    .optional()
+    .isString()
+    .trim()
+    .isLength({ min: 1 })
+    .withMessage('Prompt must not be empty'),
+  body('answer_outline')
+    .optional()
+    .isString()
+    .trim()
+    .isLength({ min: 1 })
+    .withMessage('Answer outline must not be empty'),
+  body('category')
+    .optional()
+    .isIn(['technical', 'behavioural', 'system-design', 'company-fit'])
+    .withMessage('Category must be a valid question category'),
+  body('difficulty')
+    .optional()
+    .isInt({ min: 1, max: 3 })
+    .withMessage('Difficulty must be an integer between 1 and 3')
+    .toInt(),
+];
+
+export const addQuestionValidator = [
+  ...kitIdParamValidator,
+  body('prompt').isString().trim().isLength({ min: 1 }).withMessage('Prompt is required'),
+  body('answer_outline')
+    .isString()
+    .trim()
+    .isLength({ min: 1 })
+    .withMessage('Answer outline is required'),
+  body('category')
+    .isIn(['technical', 'behavioural', 'system-design', 'company-fit'])
+    .withMessage('Category must be a valid question category'),
+  body('difficulty')
+    .optional()
+    .isInt({ min: 1, max: 3 })
+    .withMessage('Difficulty must be an integer between 1 and 3')
+    .toInt(),
+  body('requirement_ids').optional().isArray().withMessage('Requirement IDs must be an array'),
+];
+
+export const reorderQuestionsValidator = [
+  ...kitIdParamValidator,
+  body('questionIds').isArray({ min: 1 }).withMessage('Question IDs must be a non-empty array'),
+];
+
+export const deleteQuestionValidator = [...kitIdParamValidator, ...questionIdParamValidator];
+
+export const addFlashcardValidator = [
+  ...kitIdParamValidator,
+  body('front').isString().trim().isLength({ min: 1 }).withMessage('Front is required'),
+  body('back').isString().trim().isLength({ min: 1 }).withMessage('Back is required'),
+  body('requirement_ids').optional().isArray().withMessage('Requirement IDs must be an array'),
+];
+
+export const updateFlashcardValidator = [
+  ...kitIdParamValidator,
+  ...flashcardIdParamValidator,
+  body('front')
+    .optional()
+    .isString()
+    .trim()
+    .isLength({ min: 1 })
+    .withMessage('Front must not be empty'),
+  body('back')
+    .optional()
+    .isString()
+    .trim()
+    .isLength({ min: 1 })
+    .withMessage('Back must not be empty'),
+];
+
+export const deleteFlashcardValidator = [...kitIdParamValidator, ...flashcardIdParamValidator];
+
+export const updateBriefValidator = [
+  ...kitIdParamValidator,
+  body('summary')
+    .optional()
+    .isString()
+    .trim()
+    .isLength({ min: 1 })
+    .withMessage('Summary must not be empty'),
+  body('what_they_do')
+    .optional()
+    .isString()
+    .trim()
+    .isLength({ min: 1 })
+    .withMessage('What-they-do must not be empty'),
+];
+
+export const regenerateValidator = [
+  ...kitIdParamValidator,
+  body('section')
+    .isIn(['company_brief', 'schedule', 'questions'])
+    .withMessage('Section must be company_brief, schedule, or questions'),
+  body('category')
+    .if(body('section').equals('questions'))
+    .isIn(['technical', 'behavioural', 'system-design', 'company-fit'])
+    .withMessage('Category is required when regenerating questions'),
+];

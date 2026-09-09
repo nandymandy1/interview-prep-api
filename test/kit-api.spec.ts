@@ -41,9 +41,14 @@ const kitDoc = (overrides: Record<string, unknown> = {}): KitDocument =>
   }) as unknown as KitDocument;
 
 type MockRepository = {
-  [K in 'create' | 'findByUserPaginated' | 'findOwnedById' | 'addPracticeRecord']: ReturnType<
-    typeof vi.fn
-  >;
+  [
+    K in
+      | 'create'
+      | 'findByUserPaginated'
+      | 'findOwnedById'
+      | 'addPracticeRecord'
+      | 'updateGenerationState'
+  ]: ReturnType<typeof vi.fn>;
 };
 
 const mockRepository = (): KitRepository & MockRepository =>
@@ -52,6 +57,7 @@ const mockRepository = (): KitRepository & MockRepository =>
     findByUserPaginated: vi.fn(),
     findOwnedById: vi.fn(),
     addPracticeRecord: vi.fn(),
+    updateGenerationState: vi.fn(),
   }) as unknown as KitRepository & MockRepository;
 
 const paginated = (
@@ -85,7 +91,14 @@ const withSession =
 const buildApp = (repository: KitRepository & MockRepository, userId?: string) => {
   const logger = silentLogger();
   const requestContext = new RequestContextService();
-  const kitService = new KitService({ kitRepository: repository, logger });
+  const queueAdd = vi.fn(async () => ({}));
+  const kitService = new KitService({
+    kitRepository: repository,
+    generationQueue: { add: queueAdd } as never,
+    kitGeneration: {} as never,
+    research: {} as never,
+    logger,
+  });
   const kitController = singleton(() => new KitController({ kitService }));
   const app = express();
 
@@ -234,7 +247,7 @@ describe('kit owner scoping', () => {
     expect(response.status).toBe(200);
     expect(response.body).toEqual({
       success: true,
-      data: { id: KIT_A, status: 'queued', kit: null },
+      data: { id: KIT_A, status: 'queued', kit: null, practiceRecords: [] },
     });
   });
 
@@ -297,7 +310,13 @@ describe('kit list pagination validation', () => {
   });
 
   it('rejects unsafe integers before pagination', async () => {
-    const service = new KitService({ kitRepository: ownedRepository(), logger: silentLogger() });
+    const service = new KitService({
+      kitRepository: ownedRepository(),
+      generationQueue: {} as never,
+      kitGeneration: {} as never,
+      research: {} as never,
+      logger: silentLogger(),
+    });
 
     await expect(service.listKits(USER_A, { page: 2 ** 53, limit: 20 })).rejects.toThrow(
       'safe integers',
@@ -407,12 +426,30 @@ describe('kit status and practice', () => {
     expect(response.status).toBe(200);
     expect(response.body).toEqual({
       success: true,
-      data: { kitId: KIT_A, status: 'queued', progress: 0, steps: [] },
+      data: {
+        kitId: KIT_A,
+        status: 'queued',
+        progress: 0,
+        steps: [
+          { key: 'queued', label: 'Queued', state: 'pending' },
+          { key: 'researching', label: 'Researching company', state: 'pending' },
+          { key: 'generating', label: 'Generating interview kit', state: 'pending' },
+          { key: 'checking-coverage', label: 'Checking coverage', state: 'pending' },
+          { key: 'building-schedule', label: 'Building schedule', state: 'pending' },
+        ],
+        updatedAt: '2026-09-08T00:00:00.000Z',
+      },
     });
   });
 
-  it('records practice against an owned kit', async () => {
+  it('records practice against a completed owned kit', async () => {
     const repository = ownedRepository();
+    repository.findOwnedById.mockResolvedValue(
+      kitDoc({
+        status: 'completed',
+        kit: { flashcards: [{ id: 'f1' }] },
+      }),
+    );
     const response = await request(buildApp(repository, USER_A))
       .patch(`/api/kits/${KIT_A}/practice/f1`)
       .send({ confidence: 4 });
@@ -423,6 +460,15 @@ describe('kit status and practice', () => {
       flashcardId: 'f1',
       confidence: 4,
     });
+  });
+
+  it('rejects practice on a queued kit', async () => {
+    const response = await request(buildApp(ownedRepository(), USER_A))
+      .patch(`/api/kits/${KIT_A}/practice/f1`)
+      .send({ confidence: 4 });
+
+    expect(response.status).toBe(409);
+    expect(response.body).toEqual({ success: false, message: 'This kit is not ready yet.' });
   });
 
   it('rejects practice on another user kit', async () => {
@@ -436,7 +482,9 @@ describe('kit status and practice', () => {
 
   it('rejects unknown flashcards once kit content exists', async () => {
     const repository = ownedRepository();
-    repository.findOwnedById.mockResolvedValue(kitDoc({ kit: { flashcards: [{ id: 'f1' }] } }));
+    repository.findOwnedById.mockResolvedValue(
+      kitDoc({ status: 'completed', kit: { flashcards: [{ id: 'f1' }] } }),
+    );
     const response = await request(buildApp(repository, USER_A))
       .patch(`/api/kits/${KIT_A}/practice/missing`)
       .send({ confidence: 3 });

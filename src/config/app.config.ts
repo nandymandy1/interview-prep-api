@@ -12,6 +12,8 @@ export type AppConfig = {
   sessionCookieName: string;
   logLevel: string;
   braveSearchApiKey?: string;
+  geminiApiKey?: string;
+  geminiModel?: string;
 };
 
 const required = (name: string): string => {
@@ -62,5 +64,9 @@ export const loadAppConfig = (): AppConfig => {
     // Optional degradable integration: public discussion research reports
     // SEARCH_PROVIDER_NOT_CONFIGURED when absent and never blocks boot.
     braveSearchApiKey: process.env.BRAVE_SEARCH_API_KEY?.trim() || undefined,
+    // Optional: kit generation fails with a clear error when absent, but boot
+    // and every deterministic pipeline stay unaffected.
+    geminiApiKey: process.env.GEMINI_API_KEY?.trim() || undefined,
+    geminiModel: process.env.GEMINI_MODEL?.trim() || undefined,
   };
 };

@@ -15,9 +15,26 @@ export type KitPracticeRecord = {
   recordedAt: Date;
 };
 
+// Editor metadata lives outside the canonical InterviewKit (whose strict
+// schema rejects it): pinned/edited/manual flags per question ID plus the
+// company-brief fields the user edited. Regeneration preserves them.
+export type EditorQuestionMeta = {
+  pinned?: boolean;
+  edited?: boolean;
+  manual?: boolean;
+};
+
+export type EditorMeta = {
+  questions?: Record<string, EditorQuestionMeta>;
+  briefFields?: string[];
+};
+
 export type Kit = {
   userId: Types.ObjectId;
   status: KitStatus;
+  stage: string;
+  stageMessage?: string;
+  error?: { code: string; message: string };
   input: KitInput;
   kit: InterviewKit | null;
   idSequences: {
@@ -25,6 +42,7 @@ export type Kit = {
     question: number;
     flashcard: number;
   };
+  editorMeta: EditorMeta;
   practiceRecords: KitPracticeRecord[];
   createdAt: Date;
   updatedAt: Date;
@@ -63,6 +81,12 @@ const kitSchema = new Schema<Kit>(
       enum: ['queued', 'running', 'completed', 'failed'],
       required: true,
     },
+    stage: { type: String, default: 'queued' },
+    stageMessage: { type: String },
+    error: {
+      type: new Schema({ code: String, message: String }, { _id: false }),
+      required: false,
+    },
     input: {
       jd: { type: String, required: true },
       companyUrl: { type: String, required: true },
@@ -73,6 +97,7 @@ const kitSchema = new Schema<Kit>(
       type: idSequencesSchema,
       default: () => ({}),
     },
+    editorMeta: { type: Schema.Types.Mixed, default: () => ({}) },
     practiceRecords: { type: [practiceRecordSchema], default: [] },
   },
   {

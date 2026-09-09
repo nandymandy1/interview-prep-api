@@ -4,10 +4,19 @@ import type { WrapRoute } from '@/common/http/wrap-route';
 import { validationMiddleware } from '@/common/middleware/validation.middleware';
 import type { KitController } from '@/modules/kit/kit.controller';
 import {
+  addFlashcardValidator,
+  addQuestionValidator,
   createKitValidator,
+  deleteFlashcardValidator,
+  deleteQuestionValidator,
   kitIdParamValidator,
   listKitsValidator,
   recordPracticeValidator,
+  regenerateValidator,
+  reorderQuestionsValidator,
+  updateBriefValidator,
+  updateFlashcardValidator,
+  updateQuestionValidator,
 } from '@/modules/kit/kit-http.validator';
 
 export type KitRouterDependencies = {
@@ -60,9 +69,68 @@ export const createKitRouter = ({
     wrapRoute(kitController, 'recordPractice', 'kit.recordPractice'),
   );
 
+  router.patch(
+    '/:kitId/questions/:questionId',
+    updateQuestionValidator,
+    validationMiddleware,
+    wrapRoute(kitController, 'updateQuestion', 'kit.updateQuestion'),
+  );
+
+  router.post(
+    '/:kitId/questions',
+    addQuestionValidator,
+    validationMiddleware,
+    wrapRoute(kitController, 'addQuestion', 'kit.addQuestion'),
+  );
+
+  router.post(
+    '/:kitId/questions/reorder',
+    reorderQuestionsValidator,
+    validationMiddleware,
+    wrapRoute(kitController, 'reorderQuestions', 'kit.reorderQuestions'),
+  );
+
+  router.delete(
+    '/:kitId/questions/:questionId',
+    deleteQuestionValidator,
+    validationMiddleware,
+    wrapRoute(kitController, 'deleteQuestion', 'kit.deleteQuestion'),
+  );
+
+  router.post(
+    '/:kitId/flashcards',
+    addFlashcardValidator,
+    validationMiddleware,
+    wrapRoute(kitController, 'addFlashcard', 'kit.addFlashcard'),
+  );
+
+  router.patch(
+    '/:kitId/flashcards/:flashcardId',
+    updateFlashcardValidator,
+    validationMiddleware,
+    wrapRoute(kitController, 'updateFlashcard', 'kit.updateFlashcard'),
+  );
+
+  router.delete(
+    '/:kitId/flashcards/:flashcardId',
+    deleteFlashcardValidator,
+    validationMiddleware,
+    wrapRoute(kitController, 'deleteFlashcard', 'kit.deleteFlashcard'),
+  );
+
+  router.patch(
+    '/:kitId/brief',
+    updateBriefValidator,
+    validationMiddleware,
+    wrapRoute(kitController, 'updateBrief', 'kit.updateBrief'),
+  );
+
+  router.post(
+    '/:kitId/regenerate',
+    regenerateValidator,
+    validationMiddleware,
+    wrapRoute(kitController, 'regenerate', 'kit.regenerate'),
+  );
+
   return router;
 };
-
-// Deferred until their domain behavior exists: regenerate, question
-// update/reorder/delete. Their frontend hooks stay unregistered rather than
-// backed by fabricated responses.

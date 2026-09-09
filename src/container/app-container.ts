@@ -22,9 +22,16 @@ import { LinkRankingService } from '@/modules/research/crawl/link-ranking.servic
 import { RobotsPolicyService } from '@/modules/research/robots/robots-policy.service';
 import { PageExtractionService } from '@/modules/research/extraction/page-extraction.service';
 import { BraveSearchProvider } from '@/modules/research/search/brave-search.provider';
+import { BRAVE_REQUEST_GATE_KEY } from '@/modules/research/search/search.constants';
+import { RedisBraveGate } from '@/modules/research/search/brave-gate';
 import type { PublicSearchProvider } from '@/modules/research/search/search.type';
 import { PublicDiscussionResearchService } from '@/modules/research/discussion/public-discussion-research.service';
 import { CompanyResearchService } from '@/modules/research/company-research.service';
+import { GeminiService } from '@/modules/generation/gemini.service';
+import { KitGenerationService } from '@/modules/generation/kit-generation.service';
+import { createGenerationQueue } from '@/modules/generation/kit-generation.queue';
+import type { Queue } from 'bullmq';
+import type { GenerationJobData } from '@/modules/generation/generation.type';
 import { UserModel } from '@/modules/user/user.model';
 import { UserRepository } from '@/modules/user/user.repository';
 import type { RequestHandler } from 'express';
@@ -54,6 +61,9 @@ export type AppContainer = {
   publicSearchProvider: Provider<PublicSearchProvider | null>;
   publicDiscussionResearchService: Provider<PublicDiscussionResearchService>;
   companyResearchService: Provider<CompanyResearchService>;
+  geminiService: Provider<GeminiService>;
+  kitGenerationService: Provider<KitGenerationService>;
+  generationQueue: Provider<Queue<GenerationJobData>>;
 };
 
 export const createAppContainer = (config: AppConfig): AppContainer => {
@@ -125,14 +135,6 @@ export const createAppContainer = (config: AppConfig): AppContainer => {
       }),
   );
 
-  const kitService = singleton(
-    () =>
-      new KitService({
-        kitRepository: kitRepository(),
-        logger: logger(),
-      }),
-  );
-
   const kitController = singleton(
     () =>
       new KitController({
@@ -179,9 +181,18 @@ export const createAppContainer = (config: AppConfig): AppContainer => {
 
   // Null without BRAVE_SEARCH_API_KEY: discussion research degrades to a
   // structured unavailable result instead of blocking boot or fabricating.
+  // The Redis start gate keeps Brave request starts 600ms apart across the
+  // API process and worker threads sharing this Redis.
   const publicSearchProvider = singleton<PublicSearchProvider | null>(() =>
     config.braveSearchApiKey
-      ? new BraveSearchProvider({ apiKey: config.braveSearchApiKey, logger: logger() })
+      ? new BraveSearchProvider({
+          apiKey: config.braveSearchApiKey,
+          gate: new RedisBraveGate({
+            client: redis().getClient(),
+            key: BRAVE_REQUEST_GATE_KEY,
+          }),
+          logger: logger(),
+        })
       : null,
   );
 
@@ -202,6 +213,41 @@ export const createAppContainer = (config: AppConfig): AppContainer => {
       new CompanyResearchService({
         companyCrawler: companyCrawlerService(),
         discussionResearch: publicDiscussionResearchService(),
+        logger: logger(),
+      }),
+  );
+
+  // Lazy: constructing the Gemini client never touches the network, and the
+  // service throws a clear NOT_CONFIGURED error only when actually used.
+  const geminiService = singleton(
+    () =>
+      new GeminiService({
+        apiKey: config.geminiApiKey,
+        model: config.geminiModel,
+        logger: logger(),
+      }),
+  );
+
+  const kitGenerationService = singleton(
+    () =>
+      new KitGenerationService({
+        research: companyResearchService(),
+        gemini: geminiService(),
+        logger: logger(),
+      }),
+  );
+
+  // Lazy: the BullMQ Queue opens its Redis connection on first use (enqueue),
+  // so unit tests and the evaluator never pay for it.
+  const generationQueue = singleton(() => createGenerationQueue(config.redisUrl));
+
+  const kitService = singleton(
+    () =>
+      new KitService({
+        kitRepository: kitRepository(),
+        generationQueue: generationQueue(),
+        kitGeneration: kitGenerationService(),
+        research: companyResearchService(),
         logger: logger(),
       }),
   );
@@ -231,5 +277,8 @@ export const createAppContainer = (config: AppConfig): AppContainer => {
     publicSearchProvider,
     publicDiscussionResearchService,
     companyResearchService,
+    geminiService,
+    kitGenerationService,
+    generationQueue,
   };
 };

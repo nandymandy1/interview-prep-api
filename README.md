@@ -169,3 +169,47 @@ src/modules/kit/
 Do not create empty layers purely to satisfy a pattern.
 
 Then add lazy providers to `app-container.ts`, add route dependency mapping in `router-dependencies.ts`, and register the router in `routes/index.ts`.
+
+## Interview kit pipeline (assessment)
+
+Overview: paste a job description + company URL + days → `POST /api/kits` persists a
+queued kit and enqueues one BullMQ job → a worker thread researches, generates via
+Gemini, validates, repairs coverage, schedules, and persists → frontend polls
+`GET /api/kits/:kitId/status` → builder edits → flashcard practice.
+
+- Queue: one `kit-generation` BullMQ queue, `jobId = kitId` (never double-enqueue),
+  `attempts = 1`, worker `concurrency = 1`.
+- Worker thread: BullMQ `useWorkerThreads` with the external compiled processor
+  (`dist/modules/generation/kit-generation.processor.js`). Boot the API from `dist`
+  (`npm run build && npm start`); dev must build first or the worker refuses to start.
+  Same deployment — no second service; needs Node `worker_threads` allowed.
+- Progress: Redis Pub/Sub channel `kit-generation-progress` is best-effort only.
+  Mongo kit `status`/`stage` is the source of truth for `GET /status`.
+- Brave Search (2 req/s plan): every HTTP attempt passes a shared start gate
+  (`BRAVE_MIN_REQUEST_INTERVAL_MS = 600`, Redis `SET NX PX` across API/worker,
+  in-process gate in the evaluator), ≤3 sequential queries, 2 attempts, 429/backoff
+  respected. Absent key → structured unavailable, never fabricated.
+- LLM: one Gemini provider (`GEMINI_API_KEY`, `GEMINI_MODEL`), Axios,
+  `responseMimeType: application/json`, Zod-validated, 2 attempts.
+- Retrieval: Axios-only hardened client (SSRF DNS binding, `proxy: false`, 15s total
+  deadline, redirect scope/robots guards, robots.txt respected, Cheerio extraction,
+  content marked `external-untrusted`, prompts treat JD/research as data).
+- Generation sequence: JD-only requirement extraction (IDs in code) → company research
+  → brief + flashcards (one call) → four separate category calls → deterministic
+  coverage + exactly one repair pass (final uncovered MUST is `[]`) → deterministic
+  schedule for the exact day count → canonical validation.
+- Editor preservation: `pinned`/`edited`/`manual` question flags and edited brief fields
+  live in `editorMeta` outside the strict canonical kit; regeneration replaces only
+  unedited content and reuses high-water IDs.
+- Practice: completed kits only; weakest-first (unpractised → lowest confidence →
+  original order); confidence persists via practice records.
+- Evaluator (no Mongo/BullMQ/auth): `npm run evaluate -- --input <cases.json> --output
+  <kits.json>` reuses the same `KitGenerationService` sequentially and writes
+  `{version: "1.0", generated_at, kits}` Appendix B output.
+
+Env: `PORT, FRONTEND_ORIGIN, MONGODB_URI, REDIS_URL, SESSION_SECRET,
+BRAVE_SEARCH_API_KEY (optional), GEMINI_API_KEY, GEMINI_MODEL`.
+
+Known limitations: regeneration re-runs live research (costs Brave quota per click);
+single worker means one kit generates at a time; Pub/Sub progress can drop messages
+(`GET /status` stays correct).

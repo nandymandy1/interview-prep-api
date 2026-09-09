@@ -2,16 +2,24 @@ import type { Request, Response } from 'express';
 import { matchedData } from 'express-validator';
 import type { ApiSuccessResponse } from '@/common/types/api-response.type';
 import { UnauthorizedException } from '@/common/errors/http-exception';
+import type { InterviewKit } from '@/modules/kit/kit.type';
 import {
   DEFAULT_PAGE,
   DEFAULT_PAGE_LIMIT,
   type PaginatedResult,
 } from '@/common/types/pagination.type';
 import type {
+  AddFlashcardInput,
+  AddQuestionInput,
   CreateKitResult,
   KitDetailResult,
   KitStatusResult,
   KitSummary,
+  RegenerateSectionInput,
+  ReorderQuestionsInput,
+  UpdateBriefInput,
+  UpdateFlashcardInput,
+  UpdateQuestionInput,
 } from '@/modules/kit/kit-api.type';
 import type { KitService } from '@/modules/kit/kit.service';
 
@@ -93,6 +101,107 @@ export class KitController {
       data: result,
     };
 
+    res.status(200).json(response);
+  }
+
+  async updateQuestion(req: Request, res: Response): Promise<void> {
+    const kit = await this.dependencies.kitService.updateQuestion(
+      this.requireUserId(req),
+      req.params.kitId as string,
+      req.params.questionId as string,
+      req.body as UpdateQuestionInput,
+    );
+
+    const response: ApiSuccessResponse<InterviewKit> = { success: true, data: kit };
+    res.status(200).json(response);
+  }
+
+  async addQuestion(req: Request, res: Response): Promise<void> {
+    const kit = await this.dependencies.kitService.addQuestion(
+      this.requireUserId(req),
+      req.params.kitId as string,
+      req.body as AddQuestionInput,
+    );
+
+    const response: ApiSuccessResponse<InterviewKit> = { success: true, data: kit };
+    res.status(201).json(response);
+  }
+
+  async reorderQuestions(req: Request, res: Response): Promise<void> {
+    const kit = await this.dependencies.kitService.reorderQuestions(
+      this.requireUserId(req),
+      req.params.kitId as string,
+      req.body as ReorderQuestionsInput,
+    );
+
+    const response: ApiSuccessResponse<InterviewKit> = { success: true, data: kit };
+    res.status(200).json(response);
+  }
+
+  async deleteQuestion(req: Request, res: Response): Promise<void> {
+    const kit = await this.dependencies.kitService.deleteQuestion(
+      this.requireUserId(req),
+      req.params.kitId as string,
+      req.params.questionId as string,
+    );
+
+    const response: ApiSuccessResponse<InterviewKit> = { success: true, data: kit };
+    res.status(200).json(response);
+  }
+
+  async addFlashcard(req: Request, res: Response): Promise<void> {
+    const kit = await this.dependencies.kitService.addFlashcard(
+      this.requireUserId(req),
+      req.params.kitId as string,
+      req.body as AddFlashcardInput,
+    );
+
+    const response: ApiSuccessResponse<InterviewKit> = { success: true, data: kit };
+    res.status(201).json(response);
+  }
+
+  async updateFlashcard(req: Request, res: Response): Promise<void> {
+    const kit = await this.dependencies.kitService.updateFlashcard(
+      this.requireUserId(req),
+      req.params.kitId as string,
+      req.params.flashcardId as string,
+      req.body as UpdateFlashcardInput,
+    );
+
+    const response: ApiSuccessResponse<InterviewKit> = { success: true, data: kit };
+    res.status(200).json(response);
+  }
+
+  async deleteFlashcard(req: Request, res: Response): Promise<void> {
+    const kit = await this.dependencies.kitService.deleteFlashcard(
+      this.requireUserId(req),
+      req.params.kitId as string,
+      req.params.flashcardId as string,
+    );
+
+    const response: ApiSuccessResponse<InterviewKit> = { success: true, data: kit };
+    res.status(200).json(response);
+  }
+
+  async updateBrief(req: Request, res: Response): Promise<void> {
+    const kit = await this.dependencies.kitService.updateBrief(
+      this.requireUserId(req),
+      req.params.kitId as string,
+      req.body as UpdateBriefInput,
+    );
+
+    const response: ApiSuccessResponse<InterviewKit> = { success: true, data: kit };
+    res.status(200).json(response);
+  }
+
+  async regenerate(req: Request, res: Response): Promise<void> {
+    const kit = await this.dependencies.kitService.regenerate(
+      this.requireUserId(req),
+      req.params.kitId as string,
+      req.body as RegenerateSectionInput,
+    );
+
+    const response: ApiSuccessResponse<InterviewKit> = { success: true, data: kit };
     res.status(200).json(response);
   }
 

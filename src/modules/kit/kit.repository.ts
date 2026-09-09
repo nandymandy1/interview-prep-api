@@ -1,7 +1,10 @@
 import type { PaginateModel, PaginateResult } from 'mongoose';
 import type { LoggerService } from '@/infrastructure/logger/logger.service';
 import type { PaginatedResult, PaginationQuery } from '@/common/types/pagination.type';
-import type { Kit, KitDocument, KitPracticeRecord } from '@/modules/kit/kit.model';
+import type { EditorMeta, Kit, KitDocument, KitPracticeRecord } from '@/modules/kit/kit.model';
+import type { KitStatus } from '@/modules/kit/kit-api.type';
+import type { InterviewKit } from '@/modules/kit/kit.type';
+import type { KitIdSequences } from '@/modules/kit/kit-id.type';
 
 type KitRepositoryDependencies = {
   kitModel: PaginateModel<Kit>;
@@ -13,6 +16,13 @@ export type CreateKitRecord = {
   jd: string;
   companyUrl: string;
   days: number;
+};
+
+export type GenerationStateUpdate = {
+  status?: KitStatus;
+  stage?: string;
+  stageMessage?: string;
+  error?: { code: string; message: string } | null;
 };
 
 export class KitRepository {
@@ -63,6 +73,65 @@ export class KitRepository {
 
   async findOwnedById(userId: string, kitId: string): Promise<KitDocument | null> {
     return this.dependencies.kitModel.findOne({ _id: kitId, userId });
+  }
+
+  // Single owner-scoped writer for every generation stage transition. The
+  // worker persists here; Mongo stays the source of truth for GET /status.
+  async updateGenerationState(
+    userId: string,
+    kitId: string,
+    update: GenerationStateUpdate,
+  ): Promise<KitDocument | null> {
+    return this.dependencies.kitModel.findOneAndUpdate(
+      { _id: kitId, userId },
+      {
+        $set: {
+          ...(update.status !== undefined ? { status: update.status } : {}),
+          ...(update.stage !== undefined ? { stage: update.stage } : {}),
+          ...(update.stageMessage !== undefined ? { stageMessage: update.stageMessage } : {}),
+          ...(update.error !== undefined ? { error: update.error } : {}),
+        },
+      },
+      { new: true },
+    );
+  }
+
+  async saveGeneratedKit(
+    userId: string,
+    kitId: string,
+    kit: InterviewKit,
+    sequences: KitIdSequences,
+  ): Promise<KitDocument | null> {
+    return this.dependencies.kitModel.findOneAndUpdate(
+      { _id: kitId, userId },
+      {
+        $set: {
+          status: 'completed',
+          stage: 'completed',
+          stageMessage: 'Kit completed.',
+          error: null,
+          kit,
+          idSequences: sequences,
+        },
+      },
+      { new: true },
+    );
+  }
+
+  // Builder mutations persist the canonical kit plus editor metadata and the
+  // high-water sequences together; never one without the others.
+  async saveEditedKit(
+    userId: string,
+    kitId: string,
+    kit: InterviewKit,
+    sequences: KitIdSequences,
+    editorMeta: EditorMeta,
+  ): Promise<KitDocument | null> {
+    return this.dependencies.kitModel.findOneAndUpdate(
+      { _id: kitId, userId },
+      { $set: { kit, idSequences: sequences, editorMeta } },
+      { new: true },
+    );
   }
 
   async addPracticeRecord(

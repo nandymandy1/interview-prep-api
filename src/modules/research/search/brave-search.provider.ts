@@ -23,6 +23,7 @@ import type {
   PublicSearchQuery,
   PublicSearchResult,
 } from '@/modules/research/search/search.type';
+import type { BraveRequestGate } from '@/modules/research/search/brave-gate';
 
 export type BraveHttpResponse = {
   status: number;
@@ -38,6 +39,7 @@ export type BraveHttpGetter = (
 type BraveSearchProviderDependencies = {
   apiKey: string;
   logger: LoggerService;
+  gate?: BraveRequestGate;
   httpGet?: BraveHttpGetter;
   sleep?: Sleep;
   random?: RandomSource;
@@ -73,6 +75,7 @@ const braveResponseSchema = z.object({
 export class BraveSearchProvider implements PublicSearchProvider {
   private readonly apiKey: string;
   private readonly logger: LoggerService;
+  private readonly gate: BraveRequestGate | undefined;
   private readonly httpGet: BraveHttpGetter;
   private readonly sleep: Sleep;
   private readonly random: RandomSource;
@@ -81,6 +84,7 @@ export class BraveSearchProvider implements PublicSearchProvider {
   constructor(dependencies: BraveSearchProviderDependencies) {
     this.apiKey = dependencies.apiKey;
     this.logger = dependencies.logger;
+    this.gate = dependencies.gate;
     this.httpGet = dependencies.httpGet ?? this.createDefaultHttpGet();
     this.sleep = dependencies.sleep ?? defaultSleep;
     this.random = dependencies.random ?? Math.random;
@@ -94,6 +98,10 @@ export class BraveSearchProvider implements PublicSearchProvider {
     let lastFailure: SearchProviderException | null = null;
 
     for (let attempt = 1; attempt <= MAX_SEARCH_ATTEMPTS; attempt += 1) {
+      // Gate every attempt (initials and retries): request *starts* stay
+      // 600ms apart even across API/worker processes sharing Redis.
+      await this.gate?.waitForSlot();
+
       try {
         const response = await this.httpGet(url, this.headers());
 
